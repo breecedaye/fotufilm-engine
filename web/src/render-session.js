@@ -1,0 +1,930 @@
+import {
+  preferredCanvasColorSpace,
+  pixelsCanvas,
+  colorContext,
+  validateColorSpace,
+} from './canvas-color.js'
+import { createBackgroundDeveloper } from './background-developer.js'
+import { loadPerspective } from './perspective.js'
+import { cropSource, frameRenderEdit, stripSource } from './print-frame.js'
+import { loadPrintFrame } from './backend/browser-print-frame.js'
+import { renderPrintFrame16 } from './print-frame-16.js'
+import { renderPrintFrame } from './print-frame-renderer.js'
+import { lensIsActive } from './lens-correction.js'
+import { resolveLensPlan } from './lens-plan.js'
+import { loadLensCatalogue } from './lens-catalogue.js'
+import { loadFilmProfile } from './film-profile.js'
+import {
+  hasProfileSettings,
+  profileRequestControls,
+} from './profile-settings.js'
+import { loadMediumBytes } from './output-media.js'
+import { loadSceneExposure } from './scene-light.js'
+import { rawSource, scaledLinearImage } from './raw-source.js'
+import { defaultEdit, fullCrop } from './editor-state.js'
+import { validateStockSettings } from './stock-settings.js'
+import { sourceIlluminant } from './editor-catalogue.js'
+import { compositeSelection } from './backend/browser-selective.js'
+import {
+  INVALID_BORDER,
+  areaPreview,
+  denseEnd,
+  estimatedBorder,
+  loadScanPreparation,
+  plainReading,
+  positiveSource,
+} from './negative-reading.js'
+import { rolledDenseEnd } from './negative-document.js'
+import {
+  assetUrl,
+  sceneScreenMeter,
+  prepareLinearSource,
+  developNormal,
+  imageSource,
+  frameRegion,
+  measuredTone,
+  loadPack,
+  parsePack,
+  loadStages,
+  decodeRGBA,
+} from './engine.js'
+import { canvasBlob, cropImage, orientImage, outputSize } from './geometry.js'
+import { encodePreview } from './canvas-encoder.js'
+
+import { loadStockIndex } from "./stock-index.js";
+export { loadStockIndex } from "./stock-index.js";
+
+const sameCrop = (a, b) => a.every((point, i) => point.every((v, c) => v === b[i][c]))
+// The size to convert a video frame to when the edit leaves its geometry alone.
+// `rawSource` would then only scale the whole frame, sampling it where the video
+// conversion samples it, so converting at that size gives the same pixels
+// without converting, copying and reading back every native pixel first.
+function videoFrameSize(image, edit, maxEdge, cropMode, displaySize) {
+  const identity =
+    !displaySize &&
+    !lensIsActive(edit.lens) &&
+    !edit.rotation &&
+    !edit.flip &&
+    Math.abs(edit.straighten) <= 0.001 &&
+    !edit.perspectiveV &&
+    !edit.perspectiveH &&
+    (cropMode || sameCrop(edit.crop, fullCrop()))
+  const { naturalWidth: width, naturalHeight: height } = image
+  const scale = Math.min(1, maxEdge / Math.max(width, height))
+  if (!identity || scale >= 1) return null
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  }
+}
+
+// Straighten, perspective and lens correction resample a browser-decoded photo in
+// JS. Reading every pixel of a large photo for each preview stalls the page, so
+// these resample a linear copy the browser scaled to the source pixels one output
+// pixel covers. Straighten zooms in by its cover factor.
+function sampledEdge(image, edit, maxEdge, cropMode, displaySize) {
+  const w = image.naturalWidth || image.width,
+    h = image.naturalHeight || image.height
+  const swapped = edit.rotation % 2 !== 0
+  const ow = swapped ? h : w,
+    oh = swapped ? w : h
+  const crop = cropMode ? fullCrop() : edit.crop
+  const full = outputSize(crop, ow, oh)
+  const scale = Math.min(1, maxEdge / Math.max(ow, oh))
+  const output =
+    displaySize ||
+    outputSize(crop, Math.round(ow * scale), Math.round(oh * scale))
+  const angle = (Math.abs(edit.straighten) * Math.PI) / 180
+  const cos = Math.cos(angle),
+    sin = Math.sin(angle)
+  const cover = Math.max((w * cos + h * sin) / w, (h * cos + w * sin) / h)
+  const density =
+    Math.max(output.width / full.width, output.height / full.height) * cover
+  let edge = Math.ceil(Math.max(w, h) * density)
+  // Keep rawSource's frame size: the copy's longer edge covers maxEdge.
+  if (!displaySize) edge = Math.max(edge, maxEdge)
+  return edge < Math.max(w, h) ? edge : null
+}
+
+// The light controls an enlarger or a scan carries into a scanned negative's print
+// (WebProfileRequest.Negative.light); the rest finish the print at render time.
+function negativeLight(params) {
+  return Object.fromEntries(
+    ['ev', 'temperature', 'tint']
+      .filter((key) => Number.isFinite(params?.[key]))
+      .map((key) => [key, params[key]]),
+  )
+}
+
+// WASM instances share a heap. Serialize stock changes, renders, exports and disposal.
+/// Whether an edit develops from a profile prepared at its render size: any film setting does, and
+/// so does a Layered Transport edit away from the film's own medium, style and light, which are
+/// all its sealed pack holds.
+export function needsRuntimeProfile(edit, sceneKelvin) {
+  if (edit.stock === null) return false
+  // A scanned negative prints from a profile metered on its own reading.
+  if (edit.negative || hasProfileSettings(edit)) return true
+  return (
+    edit.halationModel === 'layered' &&
+    (!!edit.medium ||
+      !!sceneKelvin ||
+      (edit.digitalReference || 'auto-levels') !== 'auto-levels')
+  )
+}
+
+export class RenderSession {
+  constructor() {
+    this.pending = []
+    this.running = false
+    this.activeWork = null
+    this.packs = new Map()
+    this.developer = null
+    this.sources = []
+    this.scaledImages = []
+    this.scenePacks = new WeakMap()
+    this.negativeReadings = new WeakMap()
+    this.closed = false
+    this.lifecycle = new AbortController()
+  }
+  notifyWaiting() {
+    if (!this.activeWork) return
+    const { label, stage } = this.activeWork
+    for (const item of this.pending)
+      item.details.onWait?.(`Waiting for ${label}${stage ? ` · ${stage}` : ''}`)
+  }
+  enqueue(work, background = false, details = { label: 'engine work' }) {
+    return new Promise((resolve, reject) => {
+      this.pending.push({ work, background, details, resolve, reject })
+      this.notifyWaiting()
+      this.drain()
+    })
+  }
+  async drain() {
+    if (this.running) return
+    this.running = true
+    while (this.pending.length) {
+      const firstForeground = this.pending.findIndex((item) => !item.background)
+      const [item] = this.pending.splice(Math.max(0, firstForeground), 1)
+      this.activeWork = item.details
+      this.notifyWaiting()
+      try {
+        item.resolve(await item.work())
+      } catch (error) {
+        item.reject(error)
+      }
+    }
+    this.activeWork = null
+    this.running = false
+  }
+  async pack(
+    id,
+    medium = null,
+    halationModel = 'legacy',
+    digitalReference = 'auto-levels',
+  ) {
+    const key = `${id}:${medium || 'default'}:${halationModel}:${digitalReference}`
+    if (this.packs.has(key)) {
+      const value = this.packs.get(key)
+      this.packs.delete(key)
+      this.packs.set(key, value)
+      return value
+    }
+    let pack,
+      stockMetadata,
+      stagesUrl = null
+    if (halationModel === 'layered') {
+      if (medium)
+        throw new Error(
+          'Layered Transport uses the film’s default output medium.',
+        )
+      pack = await loadPack(assetUrl(`packs/${id}.layered.pack`))
+    } else {
+      this.catalog ??= loadStockIndex().catch((error) => {
+        this.catalog = null
+        throw error
+      })
+      const stock = (await this.catalog).find((item) => item.id === id)
+      stockMetadata = stock
+      const mediumChoice = stock?.media.find(
+        (item) => item.id === (medium || stock.defaultMedium),
+      )
+      const choice = mediumChoice?.screenConversions
+        ? mediumChoice.screenConversions.find(
+            (item) => item.id === digitalReference,
+          )
+        : mediumChoice
+      if (!choice)
+        throw new Error(
+          'This output medium is unavailable for the selected film.',
+        )
+      const base = await loadPack(assetUrl(`packs/${id}.pack`))
+      pack = choice.pack
+        ? parsePack(
+            await loadMediumBytes(base.bytes, assetUrl(`packs/${choice.pack}`)),
+          )
+        : base
+      stagesUrl = choice.stages ? assetUrl(`packs/${choice.stages}`) : null
+      if (choice.meter) pack = { ...pack, screenMeter: choice.meter }
+    }
+    const entry = { pack, stages: null, stagesUrl, stock: stockMetadata }
+    this.packs.set(key, entry)
+    if (this.packs.size > 4) this.packs.delete(this.packs.keys().next().value)
+    return entry
+  }
+  async renderer(pack, background = false, onProgress = () => {}) {
+    if (this.developer?.isAborted) this.developerReady = null
+    this.developerReady ??= createBackgroundDeveloper(pack, onProgress, () =>
+      this.onRendererReady?.(),
+      {
+        signal: this.lifecycle.signal,
+        onWarmupProgress: (state) => this.onWarmupProgress?.(state),
+      },
+    )
+      .then((developer) => {
+        if (this.closed) {
+          developer?.dispose()
+          return null
+        }
+        this.developer = developer
+        return developer
+      })
+      .catch((error) => {
+        this.developerReady = null
+        throw error
+      })
+    return this.developerReady
+  }
+  async prepare(onProgress) {
+    this.onWarmupProgress = onProgress
+    const developer = await this.renderer(null)
+    return developer ? developer.gpuReady : false
+  }
+  async source(
+    image,
+    edit,
+    maxEdge,
+    cropMode,
+    videoTime,
+    cacheSource = true,
+    onProgress = () => {},
+    stale = () => false,
+    displaySize = null,
+  ) {
+    if (image.video) {
+      const frame = await image.video.frame(
+        videoTime ?? image.video.start,
+        edit.video.encoding,
+        videoFrameSize(image, edit, maxEdge, cropMode, displaySize),
+      )
+      return this.source(
+        frame,
+        edit,
+        maxEdge,
+        cropMode,
+        null,
+        false,
+        onProgress,
+        stale,
+        displaySize,
+      )
+    }
+    const catalogue = lensIsActive(edit.lens) ? await loadLensCatalogue() : null
+    const key = JSON.stringify([
+      catalogue?.revision,
+      maxEdge,
+      displaySize,
+      cropMode,
+      edit.rotation,
+      edit.flip,
+      lensIsActive(edit.lens) ? edit.lens : null,
+      cropMode ? null : edit.crop,
+      edit.straighten,
+      edit.perspectiveV || 0,
+      edit.perspectiveH || 0,
+    ])
+    const cached = this.sources.find(
+      (item) => item.image === image && item.key === key,
+    )
+    if (cached) return cached
+    const lensPlan = lensIsActive(edit.lens)
+      ? await resolveLensPlan(image, edit.lens, onProgress)
+      : null
+    const lensTable = lensPlan && !lensPlan.identity ? lensPlan.table : null
+    const input = image
+    const perspective = await loadPerspective(input, edit, onProgress)
+    const floating =
+      displaySize ||
+      input.raw ||
+      input.linear ||
+      lensTable ||
+      perspective ||
+      Math.abs(edit.straighten) > 0.001
+    const edge =
+      floating && !input.raw && !input.linear
+        ? sampledEdge(input, edit, maxEdge, cropMode, displaySize)
+        : null
+    const sampled = edge ? this.scaledImage(input, edge) : input
+    const oriented = floating ? null : orientImage(input, edit, maxEdge)
+    const canvas = floating
+      ? null
+      : cropMode
+        ? oriented
+        : await cropImage(oriented, edit)
+    const prepare = displaySize ? async (source) => source : prepareLinearSource
+    const source = await prepare(
+      floating
+        ? rawSource(
+            sampled,
+            edit,
+            maxEdge,
+            cropMode,
+            lensTable,
+            perspective,
+            displaySize,
+          )
+        : imageSource(canvas),
+      stale,
+    )
+    if (!source) return null
+    const entry = { image, key, canvas, source, original: null }
+    if (cacheSource && maxEdge <= 2400) {
+      this.sources.unshift(entry)
+      this.sources.length = Math.min(3, this.sources.length)
+    }
+    return entry
+  }
+  // A copy up to twice the size needed serves; a drag and the detail view reuse it.
+  scaledImage(image, edge) {
+    let entry = this.scaledImages.find(
+      (item) =>
+        item.image === image && item.edge >= edge && item.edge <= 2 * edge,
+    )
+    if (!entry) {
+      // A little headroom keeps the copy as straighten's cover factor grows.
+      const size = Math.ceil(edge * 1.25)
+      entry = { image, edge: size, value: scaledLinearImage(image, size) }
+      this.scaledImages.unshift(entry)
+      this.scaledImages.length = Math.min(3, this.scaledImages.length)
+    }
+    return entry.value
+  }
+  // What a scanned negative's reading takes from its framing: the clear film it is measured
+  // against, sampled or else the thinnest film of the whole scan, and the framing's densest end.
+  // The densest end is kept, so each film reads it without drawing the scan again.
+  async negativeFraming(image, edit, report, stale) {
+    let kept = this.negativeReadings.get(image)
+    if (!kept)
+      this.negativeReadings.set(image, (kept = { border: null, framings: [] }))
+    // The framed scan by area at 512 pixels, from a copy four times that across: close to the
+    // desktop host's reduction of the whole scan, at a size a browser reads quickly.
+    const read = async (edit) => {
+      const prepared = await this.source(image, edit, 2048, false, null, false, report, stale)
+      if (!prepared || stale()) return null
+      const { source } = prepared
+      return areaPreview(
+        decodeRGBA(source.read(0, 0, source.width, source.height)),
+        source.width,
+        source.height,
+      )
+    }
+    if (!edit.negative.border && !kept.border) {
+      const whole = await read(defaultEdit())
+      if (!whole) return null
+      kept.border = estimatedBorder(whole.pixels)
+      if (!kept.border) throw new Error(INVALID_BORDER)
+    }
+    const border = edit.negative.border ?? kept.border
+    const framing = JSON.stringify([
+      border,
+      edit.rotation,
+      edit.flip,
+      lensIsActive(edit.lens) ? edit.lens : null,
+      edit.crop,
+      edit.straighten,
+      edit.perspectiveV || 0,
+      edit.perspectiveH || 0,
+    ])
+    let framed = kept.framings.find((item) => item.key === framing)
+    if (!framed) {
+      const preview = await read(edit)
+      if (!preview) return null
+      framed = {
+        key: framing,
+        border,
+        dense: denseEnd(border, preview.pixels, preview.width, preview.height),
+      }
+      kept.framings.push(framed)
+      if (kept.framings.length > 8) kept.framings.shift()
+    }
+    return framed
+  }
+  async capturePack(pack, stock, kelvin, report) {
+    if (!pack || !Number.isFinite(kelvin) || kelvin <= 0) return pack
+    const key = pack.id === '01-bypassed' ? stock + '@bypassed' : stock
+    const exposure = await loadSceneExposure(key, kelvin, report)
+    const cached = this.scenePacks.get(pack)
+    if (cached?.exposure === exposure) return cached
+    const corrected = { ...pack, exposure }
+    this.scenePacks.set(pack, corrected)
+    return corrected
+  }
+  async render({
+    image,
+    edit,
+    stock,
+    maxEdge = 1600,
+    stage = null,
+    difference = false,
+    cropMode = false,
+    background = false,
+    comparison = !background,
+    purpose = 'preview',
+    videoTime = null,
+    encode = true,
+    bitDepth = 8,
+    colorSpace = bitDepth === 16 ? 'display-p3' : preferredCanvasColorSpace(),
+    cacheSource = true,
+    showMask = false,
+    viewport = null,
+    stale = () => false,
+    onProgress = () => {},
+  }) {
+    validateColorSpace(colorSpace)
+    const region = viewport
+      ? frameRegion(viewport.width, viewport.height, viewport.region)
+      : null
+    const output = { bitDepth, colorSpace, region }
+    if (this.closed || stale()) return null
+    const requestedEdit = edit
+    if (edit.stock !== null &&
+        (hasProfileSettings(edit) || (edit.printFrame && edit.printFrame !== 'none'))) {
+      this.catalog ??= loadStockIndex().catch((error) => {
+        this.catalog = null
+        throw error
+      })
+      validateStockSettings(edit, (await this.catalog).find((item) => item.id === stock))
+    }
+    const framed =
+      !image.video &&
+      !cropMode &&
+      stage === null &&
+      !background &&
+      edit.printFrame &&
+      edit.printFrame !== 'none'
+    const frameConfiguration = framed
+      ? await loadPrintFrame(edit, 1, 1, onProgress)
+      : null
+    if (this.closed || stale()) return null
+    edit = frameRenderEdit(edit, frameConfiguration)
+    const negative = !!edit.negative && edit.stock !== null
+    const sceneKelvin = negative ? null : sourceIlluminant(edit)
+    // A Film Border develops its whole strip with the photograph, from a profile prepared at
+    // the strip's size with the gate at the photograph's edge. A scan already shows its film.
+    const developsStrip =
+      !!frameConfiguration?.strip && !viewport && !edit.negative && edit.stock !== null
+    const dynamic = needsRuntimeProfile(edit, sceneKelvin) || developsStrip
+    if (dynamic && stage !== null)
+      throw new Error(
+        'Pipeline inspection requires default film, print and filter settings.',
+      )
+    const work = { label: background ? 'film thumbnail' : purpose }
+    const report = (text) => {
+      if (this.activeWork === work) {
+        work.stage = text
+        this.notifyWaiting()
+      }
+      if (!this.closed && !stale()) onProgress(text)
+    }
+    if (
+      edit.stock !== null &&
+      !this.packs.has(
+        `${stock}:${edit.medium || 'default'}:${dynamic ? 'legacy' : edit.halationModel || 'legacy'}:${edit.digitalReference || 'auto-levels'}`,
+      )
+    )
+      report(
+        edit.medium
+          ? 'Loading film and output-medium profile'
+          : 'Loading film profile',
+      )
+    const entry =
+      edit.stock === null
+        ? null
+        : await this.pack(
+            stock,
+            edit.medium,
+            dynamic ? 'legacy' : edit.halationModel,
+            edit.digitalReference,
+          )
+    if (this.closed || stale()) return null
+    if (!entry && !this.developerReady) report('Loading light and color engine')
+    const developer = await this.renderer(
+      entry?.pack,
+      background && !!entry,
+      report,
+      dynamic,
+    )
+    work.onWait = report
+    return this.enqueue(
+      async () => {
+        if (this.closed || stale()) return null
+        const started = performance.now()
+        if (entry?.pack.transport && stage !== null)
+          throw new Error('Pipeline inspection is available with Legacy.')
+        if (entry && stage !== null) {
+          report('Loading pipeline inspection stages')
+          entry.stages ??= await loadStages(
+            assetUrl(`packs/${stock}.stages`),
+            entry.pack,
+            entry.stagesUrl,
+          )
+        }
+        if (stale()) return null
+        report(
+          cropMode
+            ? 'Preparing crop canvas'
+            : 'Preparing crop and image pixels',
+        )
+        const prepared = await this.source(
+          image,
+          edit,
+          maxEdge,
+          cropMode,
+          videoTime,
+          cacheSource,
+          report,
+          stale,
+          viewport ? { width: viewport.width, height: viewport.height } : null,
+        )
+        if (!prepared || stale()) return null
+        const { source: whole } = prepared
+        // A film border shows the part of the photograph its aperture fills, and the rest of the
+        // render is of that part.
+        const framePlan = framed && !viewport
+          ? await loadPrintFrame(requestedEdit, whole.width, whole.height, report)
+          : null
+        if (stale()) return null
+        const frameCrop = framePlan?.crop || null
+        const scan = frameCrop ? cropSource(whole, frameCrop) : whole
+        // The plan lays the frame out around the part it shows.
+        const stripPlan = developsStrip ? framePlan : null
+        const strip = stripPlan?.strip || null
+        // Not `framed`, which says whether the picture takes a print frame.
+        const reading = edit.negative
+          ? await this.negativeFraming(image, edit, report, stale)
+          : null
+        if (edit.negative && (!reading || stale())) return null
+        // The frame read on its roll's colour, when it is balanced on its roll.
+        const dense = reading && rolledDenseEnd(reading.dense, edit.negative.roll)
+        // What this frame measures for its roll (useRollActions), before any roll's colour.
+        const negativeMeasure = reading
+          ? { border: reading.border, denseEnd: reading.dense }
+          : undefined
+        // A negative without a film is a positive photograph (plainReading); one read as a film
+        // prints from its scan, which the kernels read as the film.
+        const plain =
+          edit.negative && !negative
+            ? plainReading(reading.border, dense, edit.negative.crosstalk, edit.negative.scanLight)
+            : null
+        const preparation = plain ? await loadScanPreparation() : null
+        if (stale()) return null
+        const scene = (pixels) => (plain ? positiveSource(pixels, plain, preparation) : pixels)
+        const source = scene(scan)
+        // The light over the whole strip, the photograph's own continued past its edges.
+        const film = strip ? stripSource(source, strip) : source
+        const sourceCanvas = plain || frameCrop ? null : prepared.canvas
+        const outputWidth = region?.width || film.width
+        const outputHeight = region?.height || film.height
+        const selectionSource = strip
+          ? film
+          : region
+          ? {
+              width: outputWidth,
+              height: outputHeight,
+              read: (x, y, w, h) =>
+                source.read(x + region.x, y + region.y, w, h),
+            }
+          : source
+        const rendering = (text) =>
+          report(`${text} · ${source.width}×${source.height} ${purpose}`)
+        const controls = {
+          ...edit.params,
+          gradeSpace: edit.gradeSpace,
+          seed: edit.seed,
+          // A scanned negative's tone acts on its print, keyed by each pixel's own brightness.
+          localTone: negative ? false : edit.localTone,
+          labScanDodging: edit.profile?.labScanDodging ?? 1,
+        }
+        const needsMeter =
+          !negative &&
+          (dynamic ||
+          entry?.pack.screenMeter ||
+          (controls.localTone && (controls.highlights || controls.shadows)) ||
+          (edit.selective?.localTone &&
+            (edit.selective.params.highlights || edit.selective.params.shadows)))
+        const meter =
+          viewport && needsMeter
+            ? await this.source(
+                image,
+                edit,
+                640,
+                cropMode,
+                videoTime,
+                cacheSource,
+                report,
+                stale,
+              )
+            : prepared
+        if (!meter || stale()) return null
+        const meterSource = scene(meter.source)
+        const selected = edit.stock === null ? null : stage
+        const pack = dynamic
+          ? parsePack(
+              await loadFilmProfile(
+                {
+                  stock,
+                  width: film.width,
+                  height: film.height,
+                  ...(strip ? { unexposedEdge: strip } : {}),
+                  format: edit.format,
+                  medium: edit.medium,
+                  sceneKelvin,
+                  filters: edit.filters,
+                  filterMetering: edit.filterMetering,
+                  ...(negative
+                    ? {
+                        negative: {
+                          border: reading.border,
+                          denseEnd: dense,
+                          light: negativeLight(edit.params),
+                          crosstalk: edit.negative.crosstalk ?? 0,
+                          scanLight: edit.negative.scanLight ?? 'white',
+                        },
+                      }
+                    : await sceneScreenMeter(
+                        meterSource,
+                        controls,
+                        edit.medium === 'lab-scan',
+                      )),
+                  controls: {
+                    ...profileRequestControls(edit, entry.stock),
+                    digitalReference: edit.digitalReference || 'auto-levels',
+                    halationModel: edit.halationModel || 'legacy',
+                  },
+                },
+                report,
+              ),
+            )
+          : await this.capturePack(
+              entry
+                ? selected === null
+                  ? entry.pack
+                  : entry.stages[selected]
+                : null,
+              stock,
+              sceneKelvin,
+              report,
+            )
+        if (entry && !pack)
+          throw new Error('This pipeline stage is unavailable.')
+        if (
+          viewport &&
+          !negative &&
+          (pack?.screenMeter ||
+            (controls.localTone && (controls.highlights || controls.shadows)))
+        )
+          output.toneGrid = await measuredTone(meterSource, controls)
+        developer?.usePack(pack)
+        const developed = developer
+          ? await developer.develop(film, controls, rendering, stale, output)
+          : await developNormal(film, controls, rendering, stale, output)
+        if (!developed || stale()) return null
+        let { pixels, elapsed } = developed
+        if (edit.selective?.sample && !cropMode && stage === null && !negative) {
+          report('Developing selection')
+          const local = edit.selective
+          const localControls = {
+            ...controls,
+            ...local.params,
+            localTone: local.localTone,
+            gradeSpace: local.gradeSpace,
+          }
+          const localOutput = viewport
+            ? {
+                ...output,
+                toneGrid:
+                  pack?.screenMeter ||
+                  (localControls.localTone &&
+                    (localControls.highlights || localControls.shadows))
+                    ? await measuredTone(meterSource, localControls)
+                    : null,
+              }
+            : output
+          const selected = showMask
+            ? null
+            : developer
+              ? await developer.develop(
+                  film,
+                  localControls,
+                  rendering,
+                  stale,
+                  localOutput,
+                )
+              : await developNormal(
+                  film,
+                  localControls,
+                  rendering,
+                  stale,
+                  localOutput,
+                )
+          if (stale()) return null
+          pixels = await compositeSelection(
+            selectionSource,
+            pixels,
+            selected?.pixels,
+            local,
+            showMask,
+            stale,
+          )
+          elapsed += selected?.elapsed || 0
+        }
+        let delta = null
+        if (difference && selected > 0) {
+          report('Rendering previous stage for comparison')
+          developer.usePack(
+            await this.capturePack(
+              entry.stages[selected - 1],
+              stock,
+              sceneKelvin,
+              report,
+            ),
+          )
+          const before = await developer.develop(
+            source,
+            controls,
+            rendering,
+            stale,
+            { ...output, bitDepth: 8 },
+          )
+          let peak = 0
+          for (let i = 0; i < pixels.length; i++)
+            if (i % 4 !== 3)
+              peak = Math.max(peak, Math.abs(pixels[i] - before.pixels[i]))
+          const gain = peak < 0.5 ? 1 : Math.min(128, 127 / peak)
+          pixels = pixels.map((v, i) =>
+            i % 4 === 3 ? 255 : 128 + (v - before.pixels[i]) * gain,
+          )
+          delta = { peak, gain }
+        }
+        if (stale()) return null
+        const backend = developer?.backend || 'reference'
+        if (bitDepth === 16) {
+          const output = await renderPrintFrame16(
+            pixels,
+            outputWidth,
+            outputHeight,
+            framePlan,
+            () => this.closed || stale(),
+            colorSpace,
+            { developed: !!strip },
+          )
+          if (!output || stale()) return null
+          return {
+            ...output,
+            backend,
+            elapsed,
+            framePlan,
+            negativeMeasure,
+            renderMilliseconds: performance.now() - started,
+          }
+        }
+        report(`Encoding ${purpose} image`)
+        let canvas = pixelsCanvas(pixels, outputWidth, outputHeight, colorSpace)
+        if (framePlan) {
+          report('Finishing print frame')
+          canvas = await renderPrintFrame(
+            canvas,
+            framePlan,
+            () => this.closed || stale(),
+            { developed: !!strip },
+          )
+          if (!canvas || stale()) return null
+        }
+        // Exports and background thumbnails keep their blob; previews are shown and replaced.
+        const transient = !background && purpose !== 'export'
+        const blob = !encode
+          ? null
+          : transient && !framePlan
+            ? await encodePreview(pixels, outputWidth, outputHeight, colorSpace)
+            : await canvasBlob(canvas)
+        let original = viewport || plain || frameCrop ? null : prepared.original
+        if (comparison && !original) report('Preparing original for comparison')
+        if (comparison && !original && sourceCanvas)
+          original = await canvasBlob(sourceCanvas)
+        else if (comparison && !original) {
+          const plain = await this.renderer(null)
+          plain.usePack(null)
+          const baseline = await plain.develop(
+            source,
+            defaultEdit().params,
+            rendering,
+            stale,
+            { colorSpace, region },
+          )
+          if (!baseline || stale()) return null
+          // The photograph alone, which the comparison frames as drawn.
+          const baselineWidth = region?.width || source.width,
+            baselineHeight = region?.height || source.height
+          original = transient
+            ? await encodePreview(
+                baseline.pixels,
+                baselineWidth,
+                baselineHeight,
+                colorSpace,
+              )
+            : await canvasBlob(
+                pixelsCanvas(baseline.pixels, baselineWidth, baselineHeight, colorSpace),
+              )
+        }
+        if (!viewport && !plain && !frameCrop) prepared.original = original
+        if (
+          comparison &&
+          original &&
+          framePlan?.configuration.frame !== 'none' &&
+          framePlan
+        ) {
+          const bitmap = await createImageBitmap(original)
+          const baseline = document.createElement('canvas')
+          baseline.width = bitmap.width
+          baseline.height = bitmap.height
+          colorContext(baseline, colorSpace).drawImage(bitmap, 0, 0)
+          bitmap.close()
+          const framedOriginal = await renderPrintFrame(
+            baseline,
+            framePlan,
+            () => this.closed || stale(),
+          )
+          if (!framedOriginal || stale()) return null
+          original = await canvasBlob(framedOriginal)
+        }
+        return {
+          viewport,
+          framePlan,
+          colorSpace,
+          // The whole photograph, where points are sampled.
+          sceneSource: frameCrop ? scene(whole) : source,
+          // The scan itself, where its clear film is picked.
+          scanSource: whole,
+          negativeMeasure,
+          canvas,
+          blob,
+          original,
+          elapsed,
+          renderMilliseconds: performance.now() - started,
+          delta,
+          backend,
+          width: canvas.width,
+          height: canvas.height,
+        }
+      },
+      background,
+      work,
+    )
+  }
+  stages(
+    stock,
+    medium = null,
+    halationModel = 'legacy',
+    digitalReference = 'auto-levels',
+  ) {
+    if (halationModel === 'layered') return Promise.resolve([])
+    return this.enqueue(
+      async () => {
+        const entry = await this.pack(
+          stock,
+          medium,
+          halationModel,
+          digitalReference,
+        )
+        entry.stages ??= await loadStages(
+          assetUrl(`packs/${stock}.stages`),
+          entry.pack,
+          entry.stagesUrl,
+        )
+        return entry.stages.map((s) => ({ id: s.id, label: s.label }))
+      },
+      false,
+      { label: 'pipeline inspection profiles' },
+    )
+  }
+  dispose() {
+    this.closed = true
+    this.lifecycle.abort()
+    return this.enqueue(() => {
+      this.developer?.dispose()
+      this.sources = []
+      this.scaledImages = []
+      this.developer = null
+      this.packs.clear()
+    })
+  }
+}

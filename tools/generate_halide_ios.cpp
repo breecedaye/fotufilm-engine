@@ -1,0 +1,354 @@
+#define FOTUFILM_HALIDE_ENABLED 1
+#define FOTUFILM_HALIDE_AOT_GENERATOR 1
+#include "../Sources/FotufilmHalide/Pipeline/Gpu.h"
+#include "../Sources/FotufilmHalide/Pipeline/NegativeScan.h"
+#include "../Sources/FotufilmHalide/Pipeline/Trichromatic.h"
+#include "../Sources/FotufilmHalide/Pipeline/Transport.h"
+
+using namespace fotufilm;
+using namespace fotufilm::pipelines;
+using namespace fotufilm::gpu;
+
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <iterator>
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        std::cerr << "usage: generate_halide_ios OUTPUT_DIRECTORY "
+                     "[--simulator|--macos|--macos-intel|--linux-cuda|--linux-vulkan|--android-vulkan]\n"
+                     "       [--prefix=NAME] [--count | --variant=I | --extras]  "
+                     "(default: every pipeline)\n";
+        return 2;
+    }
+    std::string platform;
+    // Compile one variant per process. Halide AOT compilation has undocumented global state, and
+    // its process-wide unique-name counter changes embedded Metal source based on compile order.
+    // Isolating variants makes output deterministic across worker counts.
+    enum class Work { Everything, OneVariant, ExtrasOnly };
+    Work work = Work::Everything;
+    int wanted = 0;
+    bool count_only = false;
+    // What the generated functions are called: `<prefix><variant>`. Linux links a CUDA and a
+    // Vulkan set side by side, so each set needs a prefix of its own.
+    std::string prefix = "fotufilm_halide_ios_";
+    for (int i = 2; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "--count") {
+            count_only = true;
+        } else if (argument.rfind("--variant=", 0) == 0) {
+            work = Work::OneVariant;
+            wanted = std::stoi(argument.substr(std::string("--variant=").size()));
+        } else if (argument == "--extras") {
+            work = Work::ExtrasOnly;
+        } else if (argument.rfind("--prefix=", 0) == 0) {
+            prefix = argument.substr(std::string("--prefix=").size());
+        } else if (argument == "--simulator" || argument == "--macos" ||
+                   argument == "--macos-intel" || argument == "--linux-cuda" ||
+                   argument == "--linux-vulkan" || argument == "--android-vulkan") {
+            platform = argument;
+        } else {
+            std::cerr << "unknown argument: " << argument << "\n";
+            return 2;
+        }
+    }
+    const bool simulator = platform == "--simulator";
+    const bool macos = platform == "--macos" || platform == "--macos-intel";
+    const bool intel = platform == "--macos-intel";
+    const bool linux_cuda = platform == "--linux-cuda";
+    const bool linux_vulkan = platform == "--linux-vulkan";
+    // Android develops through the Linux shim (FotufilmHalideLinux.cpp) on Vulkan alone, so it
+    // takes the Linux layout: whole frames, and one runtime shared with the extras.
+    const bool android = platform == "--android-vulkan";
+    const bool linux = linux_cuda || linux_vulkan || android;
+    const std::filesystem::path output(argv[1]);
+    std::filesystem::create_directories(output);
+
+    struct Variant {
+        std::string name;
+        int features;
+        bool runtime;
+        bool windowed;
+        // Compiled for exactly its stages, none of them gated at run time.
+        bool exact_stages;
+    };
+#define FOTUFILM_AOT_GENERATOR_ENTRY(variant_name, variant_mask) \
+    {prefix + #variant_name, (variant_mask), false, false, false},
+#define FOTUFILM_AOT_WINDOWED_ENTRY(variant_name, variant_mask) \
+    {prefix + #variant_name "_windowed", (variant_mask), false, true, false},
+#define FOTUFILM_AOT_EXACT_WINDOWED_ENTRY(variant_name, stages_name, variant_mask) \
+    {prefix + #variant_name "_windowed_" #stages_name, (variant_mask), false, true, true},
+    // The exact twins come last, so adding one leaves every earlier variant's tag where it was.
+    Variant variants[] = {
+        FOTUFILM_AOT_VARIANTS(FOTUFILM_AOT_GENERATOR_ENTRY)
+        FOTUFILM_AOT_WINDOWED_VARIANTS(FOTUFILM_AOT_WINDOWED_ENTRY)
+        FOTUFILM_AOT_EXACT_WINDOWED_VARIANTS(FOTUFILM_AOT_EXACT_WINDOWED_ENTRY)
+    };
+#undef FOTUFILM_AOT_EXACT_WINDOWED_ENTRY
+#undef FOTUFILM_AOT_WINDOWED_ENTRY
+#undef FOTUFILM_AOT_GENERATOR_ENTRY
+    // Linux's two sets share one runtime, compiled with --extras.
+    variants[0].runtime = !linux;
+    const int variant_count = static_cast<int>(std::size(variants));
+    if (count_only) {
+        std::cout << variant_count << "\n";
+        return 0;
+    }
+    if (work == Work::OneVariant && (wanted < 0 || wanted >= variant_count)) {
+        std::cerr << "--variant=" << wanted << " is out of range (0.."
+                  << variant_count - 1 << ")\n";
+        return 2;
+    }
+    GpuConfiguration defaults;
+    defaults.half_blur = !macos && !linux;
+    defaults.half_lut = !macos && !linux;
+    if (linux) {
+        defaults.device = linux_vulkan || android ? Halide::DeviceAPI::Vulkan
+                                                  : Halide::DeviceAPI::CUDA;
+    }
+    const auto configuration = resolve_gpu_configuration(defaults);
+    const Halide::Target target =
+        android ? GpuFramePipeline::android_vulkan_aot_target()
+        : linux ? GpuFramePipeline::linux_aot_target(configuration.device)
+        : macos ? GpuFramePipeline::macos_aot_target(intel)
+                : GpuFramePipeline::ios_aot_target(simulator, configuration.profile);
+
+    // Compiled metallib embedding: the default on Halide 22+, FOTUFILM_METAL_PRECOMPILE=0 opts
+    // out for local debugging. It cuts macOS archives from 517 MB to 137 MB and takes the
+    // readable Metal source out of the shipped binary, which is otherwise 91% shader text anyone
+    // can run strings over. tools/aot-toolchain.json and the Halide source pin define the
+    // compiler used by the public Apple AOT releases workflow;
+    // a Halide older than 22 (a local brew install, most likely) falls through the #if below and
+    // gets the old source-embedded archives automatically, no flag needed either way.
+    //
+    // The "85 of 182 variants fail" that kept this off originally was an artifact of asking for
+    // bit-exactness between two different compilers. Measured against the JIT road on Halide 22,
+    // the 85 are two populations and neither is a defect:
+    //
+    //   - 64 variants write a float picture and differ by at most 4.77e-6 on a 0..1 range, which
+    //     is under half a 16-bit code. It is the offline compiler's pow, rsqrt and exp against the
+    //     driver's, and no flag closes it: safe and default math modes produce identical numbers
+    //     on every one of the 182, and -ffp-contract=off makes a probe worse rather than better,
+    //     because the driver contracts too.
+    //   - 21 variants write an 8-bit picture, and "1.0" was one code value read as full scale.
+    //     They differ by a single code on at most 2 pixels of 331,776 — a rounding boundary
+    //     landing the other way, 0.0006% of the frame.
+    //
+    // The remaining 97 agree exactly. What this cannot be checked with is one global tolerance:
+    // the roads write different scales, so 1 admits any error at all on the float variants and
+    // 1e-5 is unmeetable by the 8-bit ones. A tolerance for this wants to be per output scale.
+#if defined(HALIDE_VERSION_MAJOR) && HALIDE_VERSION_MAJOR >= 22
+    if (const char *const precompile = std::getenv("FOTUFILM_METAL_PRECOMPILE");
+        precompile == nullptr || std::string(precompile) != "0") {
+        const char *const metal_sdk = macos       ? "macosx"
+                                      : simulator ? "iphonesimulator"
+                                                  : "iphoneos";
+        // -fmetal-math-mode=safe matches what the runtime does when it compiles from source:
+        // halide_metal_initialize_kernels calls setFastMathEnabled:false, where the offline
+        // compiler's unflagged default is fast math on. On these 182 generated kernels the flag
+        // measured as a no-op — safe and the unflagged default produced byte-identical output on
+        // every variant, so whatever divergence remains (see above) is not fast-math reassociation
+        // in this codebase's kernels. It stays on regardless: a hand-written probe kernel (a
+        // cancelling sum, a fused accumulation) does diverge under fast math and agree under safe,
+        // so the flag is defending against a category of bug the current kernels don't happen to
+        // trigger rather than one that cannot occur. -ffp-contract=off does not belong beside it —
+        // on the same probe it went from bit-exact to 3.9e-3 wrong, because the driver contracts
+        // too and turning contraction off here just disagrees with the other road.
+        // FOTUFILM_METAL_MATH_MODE names the mode, so the roads can be measured against each
+        // other; "fast" stands for the compiler's own default, which is to say no flag at all.
+        const char *const mode_name = std::getenv("FOTUFILM_METAL_MATH_MODE");
+        const std::string mode = mode_name != nullptr ? mode_name : "safe";
+        const std::string math_flag =
+            mode == "fast" ? std::string() : " -fmetal-math-mode=" + mode;
+        // Match each app's minimum OS instead of inheriting the installed SDK's target. Unflagged,
+        // Xcode 26.6 built iOS kernels for ios26.5 (AIR v28) and Xcode 27 for ios27 (AIR v29),
+        // above the iOS app's minimum.
+        const std::string deployment_flag = macos       ? " -mmacosx-version-min=14.0"
+                                            : simulator ? " -mios-simulator-version-min=18.0"
+                                                        : " -mios-version-min=18.0";
+        Halide::set_metal_compiler_and_linker(
+            std::string("xcrun -sdk ") + metal_sdk + " metal" + deployment_flag + math_flag,
+            std::string("xcrun -sdk ") + metal_sdk + " metallib");
+    }
+#endif
+    // Use short unique suffixes because Halide embeds internal names in Metal source. Full variant
+    // names added 83 MB to a 366 MB, 128-object set. Public AOT symbols use `function_name` and are
+    // unaffected.
+    int tag = 0;
+    for (const Variant &variant : variants) {
+        // Counted over every variant rather than every compiled one, so a variant's tag — and so
+        // its object — does not depend on which process happened to build it.
+        const int index = tag++;
+        if (work == Work::ExtrasOnly || (work == Work::OneVariant && index != wanted)) {
+            continue;
+        }
+        // The Linux shim develops whole frames; the row-window twins are Apple's.
+        if (linux && variant.windowed) continue;
+        try {
+            GpuFramePipeline pipeline(variant.features,
+                                        "_v" + std::to_string(index), variant.windowed, configuration,
+                                        variant.exact_stages);
+            pipeline.compile_aot((output / variant.name).string(), variant.name,
+                                 variant.runtime, target);
+        } catch (const Halide::CompileError &error) {
+            // Name the variant: eighty compile in a row, and a bare terminate() says only that
+            // one of them did not.
+            std::cerr << "compiling " << variant.name << " (mask 0x" << std::hex
+                      << variant.features << std::dec << "): " << error.what() << "\n";
+            return 1;
+        }
+    }
+
+    // Everything past this point is a handful of small one-off pipelines, compiled together by a
+    // single `--extras` process. Spreading six short objects over the pool would save nothing.
+    if (work == Work::OneVariant) {
+        return 0;
+    }
+    // Linux measures and decodes on the host, so its extra is the one runtime both sets share:
+    // CUDA and Vulkan in one, chosen between when the app starts.
+    if (linux) {
+        // Android's runtime is Vulkan's alone; there is no CUDA on a phone.
+        Halide::Target runtime = android ? GpuFramePipeline::android_vulkan_aot_target()
+                                         : GpuFramePipeline::linux_aot_target(Halide::DeviceAPI::CUDA);
+        for (const auto feature : {Halide::Target::Vulkan, Halide::Target::VulkanV12,
+                                   Halide::Target::VulkanFloat16, Halide::Target::VulkanInt8,
+                                   Halide::Target::VulkanInt16, Halide::Target::VulkanInt64})
+            runtime.set_feature(feature);
+        Halide::compile_standalone_runtime(
+            {{Halide::OutputFileType::static_library,
+              (output / (prefix + "runtime.a")).string()}},
+            runtime);
+        // Scan inversion on the CPU, as the Apple hosts fall back to it.
+        NegativeScanPipeline scan(Halide::DeviceAPI::None);
+        const Halide::Target host =
+            android ? Halide::Target(Halide::Target::Android, Halide::Target::ARM, 64,
+                                     {Halide::Target::NoRuntime, Halide::Target::StrictFloat})
+                    : Halide::Target(Halide::Target::Linux, Halide::Target::X86, 64,
+                                     {Halide::Target::SSE41, Halide::Target::NoRuntime,
+                                      Halide::Target::StrictFloat});
+        scan.output.compile_to_static_library((output / (prefix + "negative_cpu")).string(),
+                                              {scan.input, scan.parameters},
+                                              prefix + "negative_cpu", host);
+        // A scanned negative's light-frame division and plain reading.
+        ScanPreparePipeline prepare;
+        prepare.output.compile_to_static_library(
+            (output / (prefix + "scan_prepare_cpu")).string(),
+            {prepare.input, prepare.light, prepare.parameters}, prefix + "scan_prepare_cpu", host);
+        // A trichromatic scan's layers and their merge.
+        TrichromaticLayerPipeline layer;
+        layer.output.compile_to_static_library(
+            (output / (prefix + "trichromatic_layer_cpu")).string(),
+            {layer.input, layer.parameters}, prefix + "trichromatic_layer_cpu", host);
+        TrichromaticMergePipeline merge;
+        merge.output.compile_to_static_library(
+            (output / (prefix + "trichromatic_merge_cpu")).string(),
+            {merge.red, merge.green, merge.blue, merge.parameters},
+            prefix + "trichromatic_merge_cpu", host);
+        // Layered Transport's spreading, on the CPU too, of a component's light or of the scene.
+        for (const bool scene : {false, true}) {
+            const std::string name = prefix + (scene ? "transport_scene_cpu" : "transport_cpu");
+            TransportPipeline transport(Halide::DeviceAPI::None, scene);
+            transport.output.compile_to_static_library((output / name).string(),
+                                                       transport.arguments(), name, host);
+        }
+        TransportDomainPipeline domain(Halide::DeviceAPI::None);
+        domain.output.compile_to_static_library((output / (prefix + "transport_domain_cpu")).string(),
+                                                domain.arguments(), prefix + "transport_domain_cpu", host);
+        return 0;
+    }
+
+    // The two whole-frame measurements. Four kernels: the tone base does not care about the fast
+    // transcendentals, having none to take, but it is generated both ways so that the shim can
+    // reach a measurement by the same rule it reaches a develop variant.
+    struct Measurement {
+        const char *name;
+        GpuMeasurePipeline::Quantity quantity;
+        bool approximate;
+    };
+    const Measurement measurements[] = {
+        {"fotufilm_halide_ios_measure_tone", GpuMeasurePipeline::Quantity::Tone, false},
+        {"fotufilm_halide_ios_measure_flare", GpuMeasurePipeline::Quantity::Flare, false},
+        {"fotufilm_halide_ios_measure_flare_fast", GpuMeasurePipeline::Quantity::Flare, true},
+    };
+    int measurement_tag = 0;
+    for (const Measurement &measurement : measurements) {
+        // A distinct letter from the frame variants' tags, so the two sequences cannot collide.
+        GpuMeasurePipeline pipeline(measurement.quantity,
+                                      measurement.approximate,
+                                      "_m" + std::to_string(measurement_tag++), configuration);
+        pipeline.compile_aot((output / measurement.name).string(),
+                             measurement.name, target);
+    }
+
+    // The host-to-engine decode is coefficient-driven across colour spaces. Realtime frames get a
+    // second kernel with the schedule's bounded transcendental approximations.
+    for (const bool approximate : {false, true}) {
+        const std::string name = approximate
+            ? "fotufilm_halide_ios_decode_realtime" : "fotufilm_halide_ios_decode";
+        GpuDecodePipeline pipeline(approximate, approximate ? "_d1" : "_d0", configuration);
+        pipeline.compile_aot((output / name).string(), name, target);
+    }
+
+    // The whole-frame halation fields build, for the two-pass striped still path: the same
+    // decimation chain and triple-box blurs the frame schedule runs over a staged frame.
+    {
+        GpuHalationFieldsPipeline pipeline("_h0", configuration);
+        pipeline.compile_aot(
+            (output / "fotufilm_halide_ios_halation_fields").string(),
+            "fotufilm_halide_ios_halation_fields", target);
+    }
+    // Scan inversion shares its stage with the browser; compiled into shipping Apple apps.
+    for (const bool metal : {false, true}) {
+        const std::string name = metal ? "fotufilm_halide_ios_negative_metal" : "fotufilm_halide_ios_negative_cpu";
+        NegativeScanPipeline pipeline(metal ? Halide::DeviceAPI::Metal : Halide::DeviceAPI::None);
+        auto scan_target = target.with_feature(Halide::Target::NoRuntime).with_feature(Halide::Target::StrictFloat);
+        pipeline.output.compile_to_static_library((output / name).string(),
+            {pipeline.input, pipeline.parameters}, name, scan_target);
+    }
+    // A scanned negative's light-frame division and plain reading, as every JIT host runs it.
+    {
+        ScanPreparePipeline pipeline;
+        pipeline.output.compile_to_static_library(
+            (output / "fotufilm_halide_ios_scan_prepare_cpu").string(),
+            {pipeline.input, pipeline.light, pipeline.parameters},
+            "fotufilm_halide_ios_scan_prepare_cpu",
+            target.with_feature(Halide::Target::NoRuntime).with_feature(Halide::Target::StrictFloat));
+    }
+    // A trichromatic scan's layers and their merge.
+    {
+        const auto cpu = target.with_feature(Halide::Target::NoRuntime)
+                             .with_feature(Halide::Target::StrictFloat);
+        TrichromaticLayerPipeline layer;
+        layer.output.compile_to_static_library(
+            (output / "fotufilm_halide_ios_trichromatic_layer_cpu").string(),
+            {layer.input, layer.parameters}, "fotufilm_halide_ios_trichromatic_layer_cpu", cpu);
+        TrichromaticMergePipeline merge;
+        merge.output.compile_to_static_library(
+            (output / "fotufilm_halide_ios_trichromatic_merge_cpu").string(),
+            {merge.red, merge.green, merge.blue, merge.parameters},
+            "fotufilm_halide_ios_trichromatic_merge_cpu", cpu);
+    }
+    // Layered Transport spreads each component's light with the same pipeline as the JIT hosts,
+    // and exposes a component from the scene for a frame kept on the device.
+    struct TransportVariant { const char *name; bool metal, scene; };
+    for (const auto &[name, metal, scene] : {
+             TransportVariant{"fotufilm_halide_ios_transport_cpu", false, false},
+             TransportVariant{"fotufilm_halide_ios_transport_metal", true, false},
+             TransportVariant{"fotufilm_halide_ios_transport_scene_cpu", false, true},
+             TransportVariant{"fotufilm_halide_ios_transport_scene_metal", true, true}}) {
+        TransportPipeline pipeline(metal ? Halide::DeviceAPI::Metal : Halide::DeviceAPI::None, scene);
+        auto transport_target = target.with_feature(Halide::Target::NoRuntime).with_feature(Halide::Target::StrictFloat);
+        pipeline.output.compile_to_static_library((output / name).string(), pipeline.arguments(),
+                                                  name, transport_target);
+    }
+    for (const bool metal : {false, true}) {
+        const std::string name = metal ? "fotufilm_halide_ios_transport_domain_metal"
+                                       : "fotufilm_halide_ios_transport_domain_cpu";
+        TransportDomainPipeline pipeline(metal ? Halide::DeviceAPI::Metal : Halide::DeviceAPI::None);
+        pipeline.output.compile_to_static_library(
+            (output / name).string(), pipeline.arguments(), name,
+            target.with_feature(Halide::Target::NoRuntime).with_feature(Halide::Target::StrictFloat));
+    }
+    return 0;
+}

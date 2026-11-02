@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "llvm": "22.1.8",
+  "xcode_build": "27A266a",
+  "metal_version": "32023.921"
+}

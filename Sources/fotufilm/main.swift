@@ -1,0 +1,1507 @@
+import Foundation
+import FotufilmCore
+import FotufilmEditModel
+import FotufilmImaging
+#if canImport(ImageIO)
+import ImageIO
+import CoreGraphics
+import CoreImage
+import UniformTypeIdentifiers
+#endif
+
+let controlUsage = EditorControlCatalogue.all.compactMap { control -> String? in
+    guard control.offered(on: .cli), let flag = control.commandLine else { return nil }
+    let lead = "  " + flag.flag + (flag.placeholder.isEmpty ? "" : " " + flag.placeholder)
+    let padded = lead.count < 21 ? lead.padding(toLength: 21, withPad: " ", startingAt: 0) : lead + "\n" + String(repeating: " ", count: 21)
+    var words = flag.help.split(separator: " ").map(String.init)
+    var lines: [String] = []
+    var line = ""
+    while !words.isEmpty {
+        let word = words.removeFirst()
+        if line.isEmpty { line = word } else if line.count + 1 + word.count > 58 { lines.append(line); line = word } else { line += " " + word }
+    }
+    lines.append(line)
+    return padded + lines.joined(separator: "\n" + String(repeating: " ", count: 21))
+}.joined(separator: "\n")
+
+let usage = """
+fotufilm — physically based film simulation
+
+Usage:
+  fotufilm <input> <output> [options]      Process an image
+  fotufilm <input> <dir> --stages          Write the pipeline stage by stage
+  fotufilm --make-chart <output>           Write a synthetic test chart
+  fotufilm <a> <b> --diff <output>         Write A | B | amplified difference
+  fotufilm --make-chart <f> --scene spectrum  Write the demo's spectrum scene
+  fotufilm --list-stocks                   List stocks and the gauge each is known on
+  fotufilm --list-film-bases               List each negative film's predicted base densities
+                                           (linear Rec.2020, against the bare lamp)
+  fotufilm --suggest-film <scan>           Suggest which films a scanned negative could be, from
+                                           its clear film base; add --light-frame <image> of the
+                                           bare light source to weigh the base's density too
+  fotufilm --merge-trichromatic <exposure>...
+                                           Merge exposures of negatives under red, green and
+                                           blue light into scans beside the red ones
+  fotufilm --list-web-media                Export browser output-medium choices as JSON
+  fotufilm --dump-web-camera-profiles <f>  Export native camera correction anchors (or - for stdout)
+  fotufilm --dump-web-scene <directory>    Export scene-light spectral reconstruction for the browser
+  fotufilm --dump-scene-exposure <f>        Export the native exposure table (requires --scene-kelvin)
+  fotufilm --dump-labscan-reference <stock>
+                                           Print the lab-scan reference profile a calibrated
+                                           build commits for this stock
+  fotufilm --dump-wasm-pack <f>            Export a stock's kernel inputs for the browser engine
+  fotufilm --dump-wasm-stages <f>          Export the same, once per pipeline stage
+  fotufilm --dump-spectra                  Write spectral profiles as JSON
+  fotufilm --check-stocks                  Validate every installed stock
+  fotufilm --seal-pack <dir> --pack-out <f>  Seal a stock directory into a pack
+  fotufilm --open-pack <file>              List a sealed pack's contents
+  fotufilm --make-pack-key                 Print a fresh pack key
+
+Input may be JPEG/PNG/HEIC (any color space — wide gamut is converted),
+16-bit TIFF/PNG, OpenEXR, gain-map HDR (HEIC/JPEG), or camera raw
+(DNG, CR2/CR3, NEF, ARW, RAF, ORF, RW2, ...). Raw and HDR sources are
+decoded scene-referred, so highlights above diffuse white reach the film
+shoulder and drive halation the way they do on real film.
+
+Options:
+@CONTROL_FLAGS@
+  --autoexpose       Anchor the log-average scene luminance on mid-gray
+  --background <c>  Scene-linear Rec.2020 background for associated-alpha input:
+                     black, white, or R,G,B (default: black). The source is
+                     composited before film processing and the output is opaque
+  --depth <8|16>     Output bit depth (default: 16 for TIFF; otherwise 8, dithered)
+  --hlg              Write the print as 16-bit Rec.2020 HLG instead of sRGB.
+                     Implies --depth 16.
+                     With --paper cineon-log, name a .dpx output: the scan is
+                     written as a 10-bit Cineon DPX for grading.
+  --edge             Develop the film around the picture too (Emulsion Border):
+                     the gauge's unexposed band, the gate's shadow at the
+                     input's recorded aperture, and a negative's carrier
+  --f-number <n>     With --edge, the aperture the input was taken at, in place
+                     of the one its file records
+  --transport <json> Opt in to a layered transport construction (experimental)
+  --transport-backend <cpu|metal> Transport convolution backend (default: cpu)
+  --iterations <n>  Render n times; the first warms caches, remaining runs report
+                     processing time and throughput (31 measures 30 warm frames)
+  --adjacency-model <m> gaussian or screened-diffusion (default: stock's model)
+  --stages           Instead of one render, write the frame the film would make
+                     with only the physics enabled up to each stage, into the
+                     directory named as the output. It starts from every stage
+                     at its off position and turns them back on one at a time.
+                     Stages 2-5 and 7 switch off outright. Stage 8 is skipped by
+                     reading the developed negative instead of printing it.
+                     Stages 1 and 6 have no true off position -- an emulsion that
+                     does not capture or develop makes no image -- so they are
+                     bypassed to an idealized form: non-overlapping layer
+                     sensitivities, and the same characteristic curve with hard
+                     knees instead of a toe and shoulder. Each frame is
+                     accompanied by an amplified difference against the one
+                     before it, so stages that move the image by a code value or
+                     two are still visible
+
+Pack options (--seal-pack / --open-pack):
+  --pack-out <path>  Output file when sealing; output directory when opening
+  --pack-kind <k>    community or local (default: community)
+  --pack-id <id>     Pack identity; imported stock ids are qualified with it
+  --pack-version <v> Release version, e.g. 1.0.0
+  --minimum-mac-app-version <v> Minimum Mac app version, e.g. 1.6
+  --pack-name <s>    Display name
+  --pack-author <s>  Credit
+  --pack-notes <s>   Free text carried with the pack
+
+Community packs use the public community key. A local pack's key comes from
+FOTUFILM_PACK_KEY (64 hex characters) and its id from FOTUFILM_PACK_KEY_ID, so
+neither reaches a shell history or a process listing.
+""".replacingOccurrences(of: "@CONTROL_FLAGS@", with: controlUsage)
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+    exit(1)
+}
+
+let valuelessControlFlags = Set(EditorControlCatalogue.all.compactMap { control -> String? in
+    guard control.offered(on: .cli), let flag = control.commandLine, flag.placeholder.isEmpty else { return nil }
+    return flag.flag
+})
+var positional: [String] = []
+var flags: [String: String] = [:]
+var args = Array(CommandLine.arguments.dropFirst())
+while !args.isEmpty {
+    let a = args.removeFirst()
+    if a == "--list-web-media" || a == "--list-stocks" || a == "--list-stock-capabilities" || a == "--list-formats" || a == "--dump-curves"
+        || a == "--list-film-bases" || a == "--merge-trichromatic"
+        || a == "--dump-spectra" || a == "--help" || a == "-h"
+        || a == "--autoexpose" || a == "--check-stocks" || a == "--make-pack-key"
+        || a == "--stages" || a == "--hlg" || a == "--edge" || valuelessControlFlags.contains(a) {
+        flags[a] = ""
+    } else if a.hasPrefix("--") {
+        guard !args.isEmpty else { fail("Missing value for \(a)\n\n\(usage)") }
+        flags[a] = args.removeFirst()
+    } else {
+        positional.append(a)
+    }
+}
+
+if flags["--help"] != nil || flags["-h"] != nil {
+    print(usage)
+    exit(0)
+}
+
+let benchmarkIterations: Int
+if let value = flags["--iterations"] {
+    guard let count = Int(value), count > 0 else { fail("--iterations requires a positive integer") }
+    benchmarkIterations = count
+} else {
+    benchmarkIterations = 1
+}
+
+if flags["--list-stocks"] != nil || flags["--list-stock-capabilities"] != nil {
+    for (key, stock) in FilmStock.presets.sorted(by: { $0.key < $1.key }) {
+        let capability = flags["--list-stock-capabilities"] != nil
+            ? "\t\(stock.donorLayers.isEmpty ? "true" : "false")" : ""
+        print("\(key)\t\(stock.name)\t\(FilmFormat.nativeID(forStockID: key))\(capability)")
+    }
+    exit(0)
+}
+
+if flags["--list-film-bases"] != nil {
+    for film in NegativeFilmSuggestions(stocks: FilmStock.presets).films {
+        print(String(format: "%@\t%.3f\t%.3f\t%.3f", film.id, film.base.x, film.base.y, film.base.z))
+    }
+    exit(0)
+}
+
+#if canImport(CoreImage)
+if flags["--merge-trichromatic"] != nil {
+    guard !positional.isEmpty else { fail("--merge-trichromatic needs the exposures to merge") }
+    do {
+        let outcome = try TrichromaticRoll.merge(
+            positional.map { URL(fileURLWithPath: $0) },
+            decode: { url in
+                try NegativeScanImport.exposure(
+                    data: Data(contentsOf: url),
+                    identifierHint: UTType(filenameExtension: url.pathExtension)?.identifier)
+            },
+            readers: TrichromaticRoll.readers,
+            store: { scan, red in
+                let url = TrichromaticRoll.scanURL(red: red)
+                try scan.write(to: url, options: .atomic)
+                return url
+            },
+            progress: { _, status in FileHandle.standardError.write(Data("\(status)\n".utf8)) })
+        for frame in outcome.frames {
+            print(String(format: "%@ <- %@  green %.2f px, blue %.2f px%@", frame.scan.path,
+                         frame.sources.map(\.lastPathComponent).joined(separator: " "),
+                         frame.green.residual, frame.blue.residual,
+                         frame.loose ? ", lined up loosely" : ""))
+        }
+        for failure in outcome.failures {
+            print("not merged: \(failure.sources.map(\.lastPathComponent).joined(separator: " ")): \(failure.reason)")
+        }
+        if !outcome.blanks.isEmpty { print("blank: " + outcome.blanks.map(\.lastPathComponent).joined(separator: " ")) }
+        if !outcome.others.isEmpty { print("not one light: " + outcome.others.map(\.lastPathComponent).joined(separator: " ")) }
+        if !outcome.repeats.isEmpty { print("repeated: " + outcome.repeats.map(\.lastPathComponent).joined(separator: " ")) }
+        exit(outcome.failures.isEmpty ? 0 : 1)
+    } catch {
+        fail(error.localizedDescription)
+    }
+}
+#endif
+
+#if canImport(CoreImage)
+if let scanPath = flags["--suggest-film"] {
+    /// A 512-pixel preview of a scan in the film reading's linear Rec.2020, and its median.
+    func scanPreview(_ path: String) -> ImageBuffer {
+        let url = URL(fileURLWithPath: path)
+        guard let data = try? Data(contentsOf: url) else { fail("Cannot read \(path)") }
+        do {
+            let image = try NegativeScanImport.decode(
+                data: data, identifierHint: UTType(filenameExtension: url.pathExtension)?.identifier)
+            let scale = min(1, 512 / max(image.extent.width, image.extent.height))
+            return try NegativeScanImport.samples(
+                image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)),
+                colorSpace: NegativeScanImport.filmSpace)
+        } catch {
+            fail("\(path): \(error.localizedDescription)")
+        }
+    }
+    func median(_ preview: ImageBuffer) -> SIMD3<Float> {
+        var value = SIMD3<Float>()
+        for c in 0..<3 {
+            let sorted = preview.planes[c].filter(\.isFinite).sorted()
+            value[c] = sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+        }
+        return value
+    }
+    guard var reading = NegativeFilmSuggestions.read(preview: scanPreview(scanPath)) else {
+        fail("No clear film found in \(scanPath).")
+    }
+    if let path = flags["--light-frame"] {
+        reading = .init(border: reading.border, lamp: median(scanPreview(path)), measuresDensity: true)
+    }
+    let light = reading.lamp ?? SIMD3(repeating: 1)
+    let measured = (0..<3).map { -log10(max(reading.border[$0] / light[$0], 1e-6)) }
+    print(String(format: "Film base: R %.3f  G %.3f  B %.3f%@", measured[0], measured[1], measured[2],
+                 reading.measuresDensity ? "" : reading.lamp == nil
+                    ? " (colour only, against the scan's white balance)"
+                    : " (colour only, against the light shown in the frame)"))
+    for suggestion in NegativeFilmSuggestions(stocks: FilmStock.presets).suggest(reading) {
+        let names = suggestion.films.map { "\($0.name) (\($0.id))" }.joined(separator: ", ")
+        print(String(format: "%5.1f%%  ", suggestion.likelihood * 100) + names)
+    }
+    exit(0)
+}
+#endif
+
+if flags["--list-web-media"] != nil {
+    let records: [[String: Any]] = FilmStock.presets.sorted(by: { $0.key < $1.key }).map { id, stock in
+        var record = WebStockCatalogue.media(for: stock)
+        record["id"] = id
+        return record
+    }
+    do {
+        let data = try JSONSerialization.data(withJSONObject: records, options: [.sortedKeys])
+        print(String(decoding: data, as: UTF8.self))
+    } catch { fail("Could not encode output media: \(error.localizedDescription)") }
+    exit(0)
+}
+
+if let destination = flags["--dump-web-scene"] {
+    guard let values = WebSceneLight.geometry() else { fail("Spectral reconstruction is unavailable") }
+    do {
+        let folder = URL(fileURLWithPath: destination, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var bytes = Data()
+        bytes.appendFloats(values)
+        try bytes.write(to: folder.appendingPathComponent("geometry.f32"), options: .atomic)
+        let records: [(String, FilmStock)] = FilmStock.presetIDs.flatMap { id -> [(String, FilmStock)] in
+            guard let stock = FilmStock.named(id) else { return [] }
+            var bare = stock
+            bare.spectralProfile = PipelineWalk.idealizedCapture(stock.spectralProfile)
+            return [(id, stock), (id + "@bypassed", bare)]
+        }
+        let catalog = try JSONSerialization.data(withJSONObject: WebSceneLight.catalog(stocks: records),
+                                                 options: [.sortedKeys])
+        try catalog.write(to: folder.appendingPathComponent("index.json"), options: .atomic)
+    } catch { fail("Could not export scene-light assets: \(error.localizedDescription)") }
+    exit(0)
+}
+
+if let destination = flags["--dump-web-camera-profiles"] {
+    func flatten(_ rows: [SIMD3<Float>]) -> [Float] {
+        rows.flatMap { [$0.x, $0.y, $0.z] }
+    }
+    let referenceKelvin = flags["--camera-kelvin"].flatMap(Float.init)
+    let records: [[String: Any]] = CameraSpectralProfileStore.bundledProfiles.map { profile in
+        let anchors = profile.dualIlluminantMatrices()
+        var record: [String: Any] = [
+            "id": profile.id, "make": profile.make ?? "", "model": profile.model ?? "",
+            "tungsten": flatten(anchors.tungsten), "daylight": flatten(anchors.daylight)
+        ]
+        // Optional native reference for browser parity checks; production assets omit it.
+        if let kelvin = referenceKelvin, kelvin.isFinite, kelvin > 0 {
+            record["reference"] = flatten(anchors.correction(cct: kelvin))
+        }
+        return record
+    }
+    let locus: [[Float]] = (40...1000).map { mired in
+        let kelvin = 1e6 / Float(mired)
+        let xy = WhiteBalance.chromaticity(kelvin: kelvin, tint: 0)
+        let denominator = -2 * xy.x + 12 * xy.y + 3
+        return [kelvin, 4 * xy.x / denominator, 6 * xy.y / denominator]
+    }
+    do {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "version": 1, "tungstenKelvin": DualIlluminantMatrices.tungstenKelvin,
+            "daylightKelvin": DualIlluminantMatrices.daylightKelvin,
+            "profiles": records, "whiteLocus": locus
+        ], options: [.sortedKeys])
+        if destination == "-" { print(String(decoding: data, as: UTF8.self)) }
+        else { try data.write(to: URL(fileURLWithPath: destination), options: .atomic) }
+    } catch { fail("Could not export camera profiles: \(error.localizedDescription)") }
+    exit(0)
+}
+
+// The numbers `PrintPaper.labScanReferenceMidRatio`/`labScanReferenceBalance`
+// are committed from, for re-committing after a change to the reference
+// stock's sheet, the lab-scan bands, or the balance solve. A calibrated build
+// keeps its reference in its own stock set, so point FOTUFILM_STOCKS at it.
+if let stockID = flags["--dump-labscan-reference"] {
+    guard let stock = FilmStock.presets[stockID] else {
+        fail("Unknown stock '\(stockID)'. See --list-stocks")
+    }
+    let solved = SpectralRuntime.labScanReferenceSolve(for: stock)
+    print("labScanReferenceMidRatio = SIMD2<Float>(\(solved.midRatioRed), \(solved.midRatioBlue))")
+    print("labScanReferenceBalance = \(solved.balance)")
+    exit(0)
+}
+
+if flags["--dump-curves"] != nil {
+    var stocks: [String] = []
+    for (key, stock) in FilmStock.presets.sorted(by: { $0.key < $1.key }) {
+        var layers: [String] = []
+        for (layer, curve) in stock.curves.enumerated() {
+            var samples: [String] = []
+            var x: Float = -3
+            while x <= 3.001 {
+                samples.append("[\(x),\(stock.developedDensity(layer: layer, logExposure: x))]")
+                x += 0.02
+            }
+            let secondary = curve.secondary.map {
+                ",\"secondary\":{\"gamma\":\($0.gamma),\"toe\":\($0.toe)," +
+                "\"toeWidth\":\($0.toeWidth),\"shoulder\":\($0.shoulder)," +
+                "\"shoulderWidth\":\($0.shoulderWidth)}"
+            } ?? ""
+            layers.append("""
+            {"dMin":\(curve.dMin),"gamma":\(curve.gamma),"toe":\(curve.toe),\
+            "toeWidth":\(curve.toeWidth),"shoulder":\(curve.shoulder),\
+            "shoulderWidth":\(curve.shoulderWidth)\(secondary),\
+            "samples":[\(samples.joined(separator: ","))]}
+            """)
+        }
+        stocks.append("""
+        "\(key)":{"name":"\(stock.name)","monochrome":\(stock.isMonochrome),\
+        "reversal":\(stock.isReversal),\
+        "grainStrength":\(stock.grainStrength),"layers":[\(layers.joined(separator: ","))]}
+        """)
+    }
+    print("{\(stocks.joined(separator: ","))}")
+    exit(0)
+}
+
+if flags["--dump-spectra"] != nil {
+    func arrayJSON(_ values: [Float]) -> String {
+        "[" + values.map { String($0) }.joined(separator: ",") + "]"
+    }
+    var stocks: [String] = []
+    for (key, stock) in FilmStock.presets.sorted(by: { $0.key < $1.key }) {
+        let sensitivity = stock.spectralProfile.layerSensitivity.map(arrayJSON).joined(separator: ",")
+        let dyes = stock.spectralProfile.imageDyeDensity.map(arrayJSON).joined(separator: ",")
+        let minimum = stock.spectralProfile.minimumDensity.map {
+            ",\"minimumDensity\":\(arrayJSON($0))"
+        } ?? ""
+        stocks.append("\"\(key)\":{\"name\":\"\(stock.name)\",\"sensitivity\":[\(sensitivity)],\"dyes\":[\(dyes)]\(minimum)}")
+    }
+    print("{\"wavelengths\":\(arrayJSON(SpectralGrid.wavelengths)),\"stocks\":{\(stocks.joined(separator: ","))}}")
+    exit(0)
+}
+
+if flags["--list-formats"] != nil {
+    for (id, format) in FilmFormat.presets {
+        print("\(id)\t\(format.name)\t(\(format.frameHeightMM) mm frame height)")
+    }
+    print("sensor\tThe camera's own frame\t(read off the input file)")
+    exit(0)
+}
+
+if flags["--make-pack-key"] != nil {
+    print(FilmPackKey.random().hex)
+    exit(0)
+}
+
+if flags["--check-stocks"] != nil {
+    var failures = 0
+    for id in FilmStock.allPresetIDs {
+        guard let definition = FilmStock.presetDefinitions[id] else { continue }
+        do {
+            try definition.validate()
+        } catch {
+            failures += 1
+            print("✘ \(error)")
+        }
+    }
+    for warning in FilmStockPack.shared.warnings { print("! \(warning)") }
+    let checked = FilmStock.allPresetIDs.count
+    if failures == 0 {
+        print("\(checked) stock\(checked == 1 ? "" : "s") pass")
+        exit(0)
+    }
+    fail("\(failures) of \(checked) stocks failed validation")
+}
+
+/// The key the pack commands work with, out of the environment so it never reaches a shell history
+/// or a process listing. Community packs default to the public community key.
+func packKeyFromEnvironment(_ kind: FilmPackKind) -> (key: FilmPackKey, id: UInt16) {
+    guard let hex = ProcessInfo.processInfo.environment["FOTUFILM_PACK_KEY"] else {
+        if kind == .community, let newest = FilmPackKey.community.keys.max() {
+            return (FilmPackKey.community[newest]!, newest)
+        }
+        fail("""
+        Set FOTUFILM_PACK_KEY to the 64-character hex key to seal or open with. \
+        `fotufilm --make-pack-key` prints a fresh one.
+        """)
+    }
+    guard let key = try? FilmPackKey(hex: hex) else {
+        fail("FOTUFILM_PACK_KEY is not a \(FilmPackKey.byteCount)-byte hex key")
+    }
+    let id = ProcessInfo.processInfo.environment["FOTUFILM_PACK_KEY_ID"]
+        .flatMap { UInt16($0) } ?? 1
+    return (key, id)
+}
+
+if let directory = flags["--seal-pack"] {
+    guard let outputPath = flags["--pack-out"] else {
+        fail("--seal-pack needs --pack-out <file.\(FilmStockPack.sealedPathExtension)>")
+    }
+    let kindName = flags["--pack-kind"] ?? "community"
+    let kind: FilmPackKind
+    switch kindName {
+    case "community": kind = .community
+    case "local": kind = .local
+    default: fail("Unknown pack kind '\(kindName)'; expected community or local")
+    }
+
+    let definitions: [String: FilmStockDefinition]
+    do {
+        definitions = try FilmStockPack.load(
+            directory: URL(fileURLWithPath: directory, isDirectory: true))
+    } catch {
+        fail("\(error)")
+    }
+    guard !definitions.isEmpty else {
+        fail("No stock JSON found in \(directory)")
+    }
+    for definition in definitions.values {
+        do {
+            try definition.validate()
+        } catch {
+            fail("\(error)")
+        }
+    }
+
+    let packID = flags["--pack-id"]
+        ?? URL(fileURLWithPath: directory).lastPathComponent
+    let (key, keyID) = packKeyFromEnvironment(kind)
+    let manifest = FilmPackManifest(
+        packID: packID,
+        name: flags["--pack-name"] ?? packID,
+        author: flags["--pack-author"],
+        notes: flags["--pack-notes"],
+        version: flags["--pack-version"],
+        minimumMacAppVersion: flags["--minimum-mac-app-version"],
+        stocks: definitions.keys.sorted().compactMap { definitions[$0] })
+    do {
+        let sealed = try FilmPackContainer.seal(manifest, kind: kind,
+                                                keyID: keyID, key: key)
+        try sealed.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+        print("Sealed \(manifest.stocks.count) stocks as \(kind) pack "
+                + "'\(packID)' (key \(keyID)) into \(outputPath)")
+    } catch {
+        fail("\(error)")
+    }
+    exit(0)
+}
+
+if let path = flags["--open-pack"] {
+    let keyring = FilmPackKeyring()
+    for (id, key) in FilmPackKey.community { keyring.register(key, kind: .community, id: id) }
+    if ProcessInfo.processInfo.environment["FOTUFILM_PACK_KEY"] != nil {
+        let (key, keyID) = packKeyFromEnvironment(.local)
+        for kind in [FilmPackKind.community, .local] {
+            keyring.register(key, kind: kind, id: keyID)
+        }
+    }
+
+    let data: Data
+    do {
+        data = try Data(contentsOf: URL(fileURLWithPath: path))
+    } catch {
+        fail("Could not read \(path): \(error)")
+    }
+    do {
+        let (manifest, head) = try FilmPackContainer.open(data, keyring: keyring)
+        print("pack \(manifest.packID) — \(manifest.name)")
+        print("kind \(head.kind), key \(head.keyID), sealed \(manifest.created)")
+        if let version = manifest.version { print("version \(version)") }
+        if let minimum = manifest.minimumMacAppVersion { print("minimum Mac app \(minimum)") }
+        if let author = manifest.author { print("by \(author)") }
+        for stock in manifest.stocks {
+            print("  \(stock.id)\t\(stock.name)")
+        }
+        if let outputPath = flags["--pack-out"] {
+            let directory = URL(fileURLWithPath: outputPath, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            for stock in manifest.stocks {
+                try encoder.encode(stock).write(
+                    to: directory.appendingPathComponent("\(stock.id).json"),
+                    options: .atomic)
+            }
+            print("Wrote \(manifest.stocks.count) stocks to \(outputPath)")
+        }
+    } catch {
+        fail("\(error)")
+    }
+    exit(0)
+}
+
+#if canImport(ImageIO)
+/// OpenEXR convention stores associated RGB, including additive color where alpha is zero. Core
+/// Image cannot represent that color internally because its working images are premultiplied, so
+/// expose the same provider once with the alpha sample marked as padding. The ordinary decode still
+/// supplies alpha; this image supplies only the RGB that must survive until scene compositing.
+/// Loads any supported image as associated scene-referred linear Rec.2020 RGBA (`SceneImage`),
+/// reporting a camera profile match.
+func loadLinear(path: String) -> SceneImage {
+    let image: SceneImage
+    do { image = try SceneImage.decode(url: URL(fileURLWithPath: path)) }
+    catch { fail(String(describing: error)) }
+    if let profile = image.cameraProfile {
+        print(String(format: "Camera profile: %@ at %.0f K, max deviation %.4f",
+                     profile.profileID, profile.cct, profile.maxDeviation))
+    }
+    return image
+}
+
+func parseLinearBackground(_ value: String?) -> SIMD3<Float> {
+    guard let value else { return .zero }
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    switch normalized.lowercased() {
+    case "black":
+        return .zero
+    case "white":
+        return SIMD3(repeating: 1)
+    default:
+        let fields = normalized.split(separator: ",", omittingEmptySubsequences: false)
+        let components = fields.compactMap {
+            Float($0.trimmingCharacters(in: .whitespaces))
+        }
+        guard fields.count == 3, components.count == 3,
+              components.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+            fail("--background takes black, white, or three finite non-negative scene-linear "
+                + "Rec.2020 values, for example 0.18,0.18,0.18")
+        }
+        return SIMD3(components[0], components[1], components[2])
+    }
+}
+
+/// Exposure shift (in stops) that anchors the geometric-mean luminance of a scene-linear image on
+/// 18% mid-gray — what a reflected-light meter does.
+func autoExposureEV(rgba: [Float], width: Int, height: Int) -> Float {
+    let n = width * height
+    let weights = ColorScience.luminanceWeights
+    var sumLog: Double = 0
+    var counted = 0
+    for i in 0..<n {
+        let lum = weights.0 * rgba[i * 4] + weights.1 * rgba[i * 4 + 1]
+                + weights.2 * rgba[i * 4 + 2]
+        if lum > 1e-6 {
+            sumLog += log2(Double(lum))
+            counted += 1
+        }
+    }
+    guard counted > 0 else { return 0 }
+    return Float(log2(0.18) - sumLog / Double(counted))
+}
+
+func saveRGBA8(_ pixels: [UInt8], width: Int, height: Int, path: String,
+               space: CFString = CGColorSpace.displayP3) {
+    var data = pixels
+    let colorSpace = CGColorSpace(name: space)!
+    guard let ctx = CGContext(
+        data: &data, width: width, height: height,
+        bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ), let image = ctx.makeImage() else { fail("Could not create output image") }
+    writeImage(image, path: path)
+}
+
+func writeImage(_ image: CGImage, path: String) {
+    let url = URL(fileURLWithPath: path)
+    let lower = path.lowercased()
+    let type: String
+    if lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg") {
+        type = UTType.jpeg.identifier
+    } else if lower.hasSuffix(".tif") || lower.hasSuffix(".tiff") {
+        if image.bitsPerComponent == 16 {
+            guard PrintEncoding.writeTIFF(image, to: url) else { fail("Could not write: \(path)") }
+            return
+        }
+        type = UTType.tiff.identifier
+    } else if lower.hasSuffix(".heic") || lower.hasSuffix(".heif") {
+        type = UTType.heic.identifier
+    } else {
+        type = UTType.png.identifier
+    }
+    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type as CFString, 1, nil) else {
+        fail("Could not create destination: \(path)")
+    }
+    CGImageDestinationAddImage(dest, image, nil)
+    guard CGImageDestinationFinalize(dest) else { fail("Could not write: \(path)") }
+}
+
+/// Writes display-linear reflectance as a 16-bit Rec.2020 HLG image — the same print
+/// `saveReflectance` writes, given room above diffuse white instead of the SDR shoulder's
+/// compression into `[0.9, 1)`.
+///
+/// This is the delivery half of the range the loader already reads in: a gain-map or HLG source
+/// is metered into the film's latitude on the way through, and without this there was nowhere for
+/// the result to land but an SDR container.
+func saveHLG(_ rgba: [Float], width: Int, height: Int, path: String) {
+    let components = width * height * 4
+    guard components > 0, rgba.count >= components else {
+        fail("Nothing to write to \(path)")
+    }
+    let pixels = UnsafeMutableBufferPointer<UInt16>.allocate(capacity: components)
+    pixels.initialize(repeating: 0)
+    rgba.withUnsafeBufferPointer { source in
+        PrintEncoding.encodeRows(source, rows: 0..<height, width: width,
+                                 into: pixels, transfer: .hlg)
+    }
+    guard let space = PrintEncoding.colorSpace(for: .rec2020HLG) else {
+        pixels.deallocate()
+        fail("No Rec.2020 HLG color space available")
+    }
+    guard let image = PrintEncoding.makeImage(takingOwnershipOf: pixels,
+                                              width: width, height: height,
+                                              colorSpace: space) else {
+        fail("Could not create the HLG output image")
+    }
+    writeImage(image, path: path)
+}
+
+/// Writes display-linear reflectance (interleaved RGBA floats) as an sRGB
+/// image at the requested bit depth.
+func saveReflectance(_ rgba: [Float], width: Int, height: Int, path: String,
+                     depth: Int, seed: UInt64, shoulderKnee: Float) {
+    let n = width * height
+    if depth <= 8 {
+        let pixels = DisplayEncoding.encode8(rgba, width: width, height: height, knee: shoulderKnee,
+                                             seed: UInt32(truncatingIfNeeded: seed))
+        saveRGBA8(pixels, width: width, height: height, path: path)
+        return
+    }
+    var pixels = [UInt16](repeating: 65535, count: n * 4)
+    for i in 0..<n {
+        for c in 0..<3 {
+            let v = ColorScience.linearToSrgb(ColorScience.displayShoulder(
+                    rgba[i * 4 + c], knee: shoulderKnee))
+            pixels[i * 4 + c] = UInt16(clamp(v * 65535 + 0.5, 0, 65535))
+        }
+        pixels[i * 4 + 3] = UInt16(clamp(rgba[i * 4 + 3] * 65535 + 0.5, 0, 65535))
+    }
+    let colorSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+    let image: CGImage? = pixels.withUnsafeBytes { buffer in
+        guard let provider = CGDataProvider(data: Data(buffer) as CFData) else { return nil }
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 16, bitsPerPixel: 64,
+            bytesPerRow: width * 8, space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                                     | CGBitmapInfo.byteOrder16Little.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+    guard let image else { fail("Could not create 16-bit output image") }
+    writeImage(image, path: path)
+}
+#endif
+
+func makeChart(width: Int = 960, height: Int = 640) -> [UInt8] {
+    var pixels = [UInt8](repeating: 255, count: width * height * 4)
+    func put(_ x: Int, _ y: Int, _ r: Float, _ g: Float, _ b: Float) {
+        let i = (y * width + x) * 4
+        pixels[i] = UInt8(clamp(r * 255, 0, 255))
+        pixels[i + 1] = UInt8(clamp(g * 255, 0, 255))
+        pixels[i + 2] = UInt8(clamp(b * 255, 0, 255))
+        pixels[i + 3] = 255
+    }
+    for y in 0..<(height / 2) {
+        for x in 0..<width {
+            let v = Float(x) / Float(width - 1)
+            put(x, y, v, v, v)
+        }
+    }
+    for y in (height / 8)..<(height / 4) {
+        for x in (width * 3 / 8)..<(width * 5 / 8) {
+            put(x, y, 1, 1, 1)
+        }
+    }
+    let patches: [(Float, Float, Float)] = [
+        (0.90, 0.10, 0.10), (0.10, 0.75, 0.15), (0.10, 0.20, 0.85),
+        (0.95, 0.85, 0.10), (0.80, 0.15, 0.75), (0.10, 0.80, 0.80),
+        (0.87, 0.67, 0.53), (0.55, 0.38, 0.28), (0.18, 0.18, 0.18),
+    ]
+    let cols = 3
+    let patchW = width / cols
+    let patchH = (height / 2) / 3
+    for (idx, p) in patches.enumerated() {
+        let px = (idx % cols) * patchW
+        let py = height / 2 + (idx / cols) * patchH
+        for y in py..<min(py + patchH, height) {
+            for x in px..<min(px + patchW, width) {
+                put(x, y, p.0, p.1, p.2)
+            }
+        }
+    }
+    return pixels
+}
+
+/// The demo's spectrum scene, encoded for a PNG.
+///
+/// The scene itself is `SpectrumScene` in FotufilmCore, because the app's Film Model screen develops
+/// the same picture and two copies of it would drift. What stays here is only the encode: the
+/// levels are authored scene-linear, and a browser canvas hands its bytes back as sRGB.
+func makeSpectrumScene(width: Int, height: Int) -> [UInt8] {
+    let scene = SpectrumScene.make(width: width, height: height)
+    var pixels = [UInt8](repeating: 255, count: width * height * 4)
+    func encode(_ v: Float) -> UInt8 {
+        UInt8(clamp(ColorScience.linearToSrgb(clamp(v, 0, 1)) * 255 + 0.5, 0, 255))
+    }
+    for i in 0..<(width * height) {
+        pixels[i * 4] = encode(scene.image.planes[0][i])
+        pixels[i * 4 + 1] = encode(scene.image.planes[1][i])
+        pixels[i * 4 + 2] = encode(scene.image.planes[2][i])
+    }
+    return pixels
+}
+
+#if canImport(ImageIO)
+if let chartPath = flags["--make-chart"] {
+    var width = 960, height = 640
+    if let size = flags["--chart-size"] {
+        let parts = size.split(separator: "x").compactMap { Int($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
+            fail("--chart-size takes WIDTHxHEIGHT, e.g. 1024x683")
+        }
+        (width, height) = (parts[0], parts[1])
+    }
+    if flags["--scene"] == "spectrum" {
+        // Written sRGB rather than Display P3: the levels in this scene are chosen for what the
+        // film should see, and a browser canvas returns whatever it was given as sRGB.
+        saveRGBA8(makeSpectrumScene(width: width, height: height),
+                  width: width, height: height, path: chartPath, space: CGColorSpace.sRGB)
+        print("Wrote the spectrum scene at \(width)x\(height) to \(chartPath)")
+        exit(0)
+    }
+    saveRGBA8(makeChart(width: width, height: height), width: width, height: height, path: chartPath)
+    print("Wrote test chart to \(chartPath)")
+    exit(0)
+}
+
+// A/B evidence for engine levers: two finished renders side by side with their
+// amplified difference, plus the numbers the difference amounts to.
+if let diffPath = flags["--diff"] {
+    guard positional.count == 2 else {
+        fail("--diff <out> takes two rendered images: fotufilm <a> <b> --diff <out>")
+    }
+    let a = loadLinear(path: positional[0])
+    let b = loadLinear(path: positional[1])
+    guard a.width == b.width, a.height == b.height else {
+        fail("Images differ in size: \(a.width)x\(a.height) vs \(b.width)x\(b.height)")
+    }
+    let width = a.width, height = a.height, count = width * height
+    var peak: Float = 0
+    var sum: Double = 0, sumSquares: Double = 0
+    var channelSum = [Double](repeating: 0, count: 3)
+    var difference = [Float](repeating: 1, count: count * 4)
+    for i in 0..<count {
+        for c in 0..<3 {
+            let d = abs(a.rgba[i * 4 + c] - b.rgba[i * 4 + c])
+            difference[i * 4 + c] = d
+            peak = max(peak, d)
+            sum += Double(d)
+            sumSquares += Double(d) * Double(d)
+            channelSum[c] += Double(a.rgba[i * 4 + c] - b.rgba[i * 4 + c])
+        }
+    }
+    // Amplify so the largest change appears as display white, exactly as the
+    // stage sequence presents its deltas.
+    let gain = peak > 1e-6 ? 0.9 / peak : 1
+    var composite = [Float](repeating: 1, count: count * 3 * 4)
+    for y in 0..<height {
+        for x in 0..<width {
+            let src = (y * width + x) * 4
+            let row = y * width * 3
+            for c in 0..<3 {
+                composite[(row + x) * 4 + c] = a.rgba[src + c]
+                composite[(row + width + x) * 4 + c] = b.rgba[src + c]
+                composite[(row + 2 * width + x) * 4 + c] = difference[src + c] * gain
+            }
+        }
+    }
+    let depth = Int(flags["--depth"] ?? "8") ?? 8
+    saveReflectance(composite, width: width * 3, height: height,
+                    path: diffPath, depth: depth, seed: 0,
+                    shoulderKnee: FilmSDRDelivery.boundedShoulderKnee)
+    let pixels = Double(count * 3)
+    print(String(format: "peak %.5f  mean %.5f  rms %.5f  gain %.0fx",
+                 peak, sum / pixels, (sumSquares / pixels).squareRoot(), gain))
+    print(String(format: "signed channel means  R %+.5f  G %+.5f  B %+.5f",
+                 channelSum[0] / Double(count), channelSum[1] / Double(count),
+                 channelSum[2] / Double(count)))
+    exit(0)
+}
+
+// The pack export names its own output and reads no image, so it is the one mode that resolves a
+// stock without an input/output pair.
+/// Develops one image through every stage of the walkthrough, writing a frame per step and an
+/// amplified difference against the step before it.
+func writeStageSequence(linear: ImageBuffer, alpha: [Float], stock: FilmStock,
+                        options: FotufilmEngine.Options, directory: String, depth: Int) {
+    do {
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: directory, isDirectory: true),
+            withIntermediateDirectories: true)
+    } catch {
+        fail("Could not create \(directory): \(error)")
+    }
+    let width = linear.width, height = linear.height
+    let count = width * height
+    let steps = PipelineWalk.steps(stock: stock, options: options)
+
+    // A manifest beside the frames, so anything reading the directory back — the browser demo's
+    // static fallback among them — gets the labels and the order from the run that wrote them
+    // rather than by parsing filenames or this program's console output.
+    var manifest: [String] = []
+
+    var previous: [Float]?
+    for step in steps {
+        let out = FotufilmEngine(stock: step.stock, options: step.options)
+            .process(linearRGB: linear)
+        var reflectance = [Float](repeating: 1, count: count * 4)
+        for i in 0..<count {
+            reflectance[i * 4] = out.planes[0][i]
+            reflectance[i * 4 + 1] = out.planes[1][i]
+            reflectance[i * 4 + 2] = out.planes[2][i]
+            reflectance[i * 4 + 3] = alpha[i * 4 + 3]
+        }
+        saveReflectance(reflectance, width: width, height: height,
+                        path: "\(directory)/\(step.id).png", depth: depth,
+                        seed: step.options.seed,
+                        shoulderKnee: step.options.sdrShoulderKnee(for: step.stock))
+
+        // The lightbox negative is an aside, not a step: it neither takes a
+        // difference nor becomes the baseline for the print that follows it.
+        let isAside = step.id.hasSuffix("-negative")
+        let hasDelta = previous != nil && !isAside
+        manifest.append("""
+        {"id":"\(step.id)","label":"\(step.label)","file":"\(step.id).png"\
+        \(hasDelta ? ",\"delta\":\"\(step.id)-delta.png\"" : "")}
+        """)
+        if let previous, !isAside {
+            var difference = [Float](repeating: 1, count: count * 4)
+            var peak: Float = 0
+            for i in 0..<count {
+                for c in 0..<3 {
+                    let d = abs(reflectance[i * 4 + c] - previous[i * 4 + c])
+                    difference[i * 4 + c] = d
+                    peak = max(peak, d)
+                }
+            }
+            // Amplify so the largest change this stage made appears as display
+            // white; without it the subtler stages are a code value or two.
+            let gain = peak > 1e-6 ? 0.9 / peak : 1
+            for i in 0..<(count * 4) where i % 4 != 3 { difference[i] *= gain }
+            saveReflectance(difference, width: width, height: height,
+                            path: "\(directory)/\(step.id)-delta.png", depth: depth,
+                            seed: step.options.seed,
+                            shoulderKnee: FilmSDRDelivery.boundedShoulderKnee)
+            print(String(format: "%@\tpeak %.4f\tgain %.0fx", step.label, peak, gain))
+        } else {
+            print(step.label)
+        }
+        if !isAside { previous = reflectance }
+    }
+    let entries: String = manifest.joined(separator: ",")
+    let index: String = """
+    {"stock":"\(stockID)","name":"\(stock.name)","stages":[\(entries)]}
+    """
+    do {
+        try index.write(toFile: "\(directory)/index.json", atomically: true, encoding: .utf8)
+    } catch {
+        fail("Could not write \(directory)/index.json: \(error.localizedDescription)")
+    }
+    print("Wrote \(steps.count) stage frames to \(directory)")
+}
+
+guard positional.count == 2 || flags["--dump-wasm-pack"] != nil
+    || flags["--dump-wasm-stages"] != nil
+    || flags["--dump-scene-exposure"] != nil else { fail(usage) }
+
+if FilmStock.allPresetIDs.isEmpty {
+    if let error = FilmStockPack.loadError {
+        fail("No film stocks could be loaded: \(error)")
+    }
+    fail("""
+    No film stocks installed. Point FOTUFILM_STOCKS at a stock pack directory, \
+    or use the stocks bundled with the package.
+    """)
+}
+
+let stock: FilmStock
+let stockID: String
+if let requested = flags["--stock"] {
+    guard let match = FilmStock.named(requested) else {
+        fail("Unknown stock '\(requested)'. Use --list-stocks to see options.")
+    }
+    stock = match
+    stockID = requested
+} else {
+    stockID = FilmStock.presetIDs.first ?? FilmStock.allPresetIDs.first!
+    stock = FilmStock.named(stockID)!
+}
+
+var options = FotufilmEngine.Options()
+if let stated = flags["--scene-kelvin"] {
+    guard let kelvin = Float(stated), kelvin.isFinite, (1000...25000).contains(kelvin) else {
+        fail("--scene-kelvin takes a temperature from 1000 to 25000 K")
+    }
+    options.sceneIlluminantKelvin = kelvin
+}
+options.format = FilmFormat.native(forStockID: stockID)
+for control in EditorControlCatalogue.all {
+    guard let flag = control.commandLine else { continue }
+    guard let text = flags[flag.flag] else { continue }
+    do {
+        try control.applyCommandLineValue(text, to: &options)
+    } catch {
+        fail(String(describing: error))
+    }
+}
+if let formatID = flags["--format"] {
+    // `sensor` is the frame the input file says it was exposed on, cut from the film the stock
+    // names — the app's own automatic gauge, asked for by hand here because the CLI is a
+    // reproducible path and a default that changed with the input's metadata would not be one.
+    if formatID == "sensor" {
+        guard let input = positional.first else {
+            fail("--format sensor needs an input file to read the frame from.")
+        }
+        guard let frame = SensorFrame.read(url: URL(fileURLWithPath: input)) else {
+            fail("""
+            \(input) does not say what frame it was exposed on. \
+            Name a gauge instead; --list-formats has them.
+            """)
+        }
+        options.format = frame.gauge.format
+        print("""
+        Sensor frame: \(frame.frameSize) \
+        (\(String(format: "%.2f", frame.cropFactor))x crop) \
+        -> \(options.format.name), the nearest gauge \
+        (\(String(format: "%.2f", frame.gaugeStretch))x)
+        """)
+    } else {
+        guard let format = FilmFormat.preset(id: formatID) else {
+            fail("Unknown format '\(formatID)'. Use --list-formats to see options.")
+        }
+        options.format = format
+    }
+}
+if let model = flags["--grain-model"] {
+    if let resolved = GrainModel.named(model) {
+        options.grainModel = resolved
+    } else {
+        FileHandle.standardError.write(Data(
+            "unknown grain model '\(model)'; expected standard/clump or film\n".utf8))
+        exit(2)
+    }
+}
+if let text = flags["--halation-return"] {
+    guard let percent = Float(text), percent.isFinite, (0...100).contains(percent) else {
+        fail("--halation-return requires a percentage from 0 through 100")
+    }
+    options.halationReturnRatio = percent / 100
+}
+if let path = flags["--transport"] {
+    do {
+        let model = try JSONDecoder().decode(LayeredTransport.self,
+            from: Data(contentsOf: URL(fileURLWithPath: path)))
+        try model.validate()
+        options.layeredTransport = model
+    } catch { fail("Invalid transport construction: \(error.localizedDescription)") }
+}
+if let backend = flags["--transport-backend"] {
+    switch backend {
+    case "cpu": options.transportBackend = .cpu
+    case "metal": options.transportBackend = .metal
+    default: fail("--transport-backend requires cpu or metal")
+    }
+}
+if options.transportConstruction(for: stock) != nil {
+    if ["--stages", "--dump-wasm-stages"].contains(where: { flags[$0] != nil }) {
+        fail("Layered transport stage-sequence exports are not supported.")
+    }
+}
+if let model = flags["--adjacency-model"] {
+    guard let adjacency = AdjacencyModel(rawValue: model) else {
+        FileHandle.standardError.write(Data("unknown adjacency model '\(model)'; expected gaussian or screened-diffusion\n".utf8))
+        exit(1)
+    }
+    options.adjacencyModel = adjacency
+}
+if let m = flags["--mottle"] { options.grainMottleShare = Float(m) }
+if let p = flags["--push"] {
+    guard let stops = Float(p), stops.isFinite else {
+        fail("Invalid --push value '\(p)'; expected a stop value this stock lists.")
+    }
+    do {
+        _ = try stock.pushed(stops: stops)
+    } catch {
+        fail("\(error)")
+    }
+    options.developmentEV = stops
+}
+if let k = flags["--print-light"] { options.printViewingKelvin = Float(k) }
+if let s = flags["--seed"] { options.seed = UInt64(s) ?? options.seed }
+if let coating = flags["--filter-coating"], FilterCoating(rawValue: coating) == nil {
+    fail("Unknown coating '\(coating)'. Choices: "
+         + FilterCoating.allCases.map(\.rawValue).joined(separator: ", "))
+}
+let filterCoating = flags["--filter-coating"]
+    .flatMap { FilterCoating(rawValue: $0) } ?? .multiCoated
+if let list = flags["--filter"] {
+    var fitted: [LensFilter] = []
+    for id in list.split(separator: ",").map(String.init) {
+        guard var found = LensFilter.catalogued(id) else {
+            fail("Unknown filter '\(id)'. Choices: "
+                 + LensFilter.catalogue.map(\.id).joined(separator: ", "))
+        }
+        found.coating = filterCoating
+        fitted.append(found)
+    }
+    let metering = flags["--metering"] ?? "ttl"
+    let compensation: LensFilterCompensation
+    switch metering {
+    case "none": compensation = .none
+    case "ttl": compensation = .throughTheLens
+    case "factor": compensation = .filmSpeed
+    default: fail("Unknown metering '\(metering)'. Choices: none, ttl, factor")
+    }
+    options.lensFilters = LensFilterStack(fitted, compensation: compensation)
+}
+if let family = flags["--diffusion"] {
+    guard let chosen = DiffusionFilter.Family(rawValue: family) else {
+        fail("Unknown diffusion filter '\(family)'. Choices: "
+             + DiffusionFilter.Family.allCases.map(\.rawValue).joined(separator: ", "))
+    }
+    let name = flags["--diffusion-grade"] ?? "1/4"
+    guard let grade = DiffusionFilter.Grade(rawValue: name) else {
+        fail("Unknown grade '\(name)'. Choices: "
+             + DiffusionFilter.Grade.allCases.map(\.rawValue).joined(separator: ", "))
+    }
+    options.diffusionFilter = DiffusionFilter.preset(chosen, grade: grade,
+                                                     coating: filterCoating)
+}
+if let p = flags["--paper"] {
+    guard let choice = PrintPaper.preset(id: p) else {
+        fail("Unknown paper '\(p)'. Choices: "
+             + PrintPaper.allCases.map(\.id).joined(separator: ", "))
+    }
+    options.paper = choice
+}
+let printerFlags = ["--printer-lamp", "--printer-ev", "--printer-m", "--printer-y"]
+if let id = flags["--printer"] {
+    guard id == "simulated-tungsten" else { fail("Unknown printer '\(id)'; expected simulated-tungsten") }
+    guard flags["--negative"] == nil,
+          Enlarger.illuminates(stock: stock, paper: options.paper(for: stock)) else {
+        fail("The simulated printer requires film enlarged onto compatible reflection paper")
+    }
+    func printerValue(_ flag: String, default fallback: Float, range: ClosedRange<Float>) -> Float {
+        guard let text = flags[flag] else { return fallback }
+        guard let value = Float(text), value.isFinite, range.contains(value) else {
+            fail("\(flag) requires a finite value in \(range.lowerBound)...\(range.upperBound)")
+        }
+        return value
+    }
+    options.printer = PrinterProfile(
+        lampKelvin: printerValue("--printer-lamp", default: 3200, range: PrinterProfile.lampRange),
+        exposureEV: printerValue("--printer-ev", default: 0, range: PrinterProfile.exposureRange),
+        magenta: printerValue("--printer-m", default: 0.4, range: PrinterProfile.filterRange),
+        yellow: printerValue("--printer-y", default: 0.5, range: PrinterProfile.filterRange))
+} else if printerFlags.contains(where: { flags[$0] != nil }) {
+    fail("Printer controls require --printer simulated-tungsten")
+}
+if let n = flags["--negative"] {
+    switch n {
+    case "lightbox": options.negativeViewing = .lightBox
+    case "scanner": options.negativeViewing = .scanner
+    default: fail("--negative takes 'lightbox' or 'scanner'")
+    }
+}
+// The browser engine runs the same Halide kernels but cannot build their inputs: the spectral
+// tables are a wavelength-domain solve, and the packed configuration folds in the coupler warp,
+// the halation kernel and the print curves. All of it is exported here instead, so the WebAssembly
+// side only has to hand the numbers to the kernel.
+//
+// The pack is tied to a frame size, because every spatial parameter in it is a diffusion length
+// in millimetres scaled by the frame's pixels-per-mm. A frame of another size needs another pack.
+/// The frame a pack is being sealed for. Every spatial parameter in a pack is a diffusion length
+/// in millimetres multiplied by this frame's pixels-per-mm, so the size is part of the export,
+/// not a detail of the caller.
+func packFrameSize() -> (width: Int, height: Int) {
+    let size = flags["--pack-size"] ?? "1600x900"
+    let parts = size.split(separator: "x").compactMap { Int($0) }
+    guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
+        fail("--pack-size takes WIDTHxHEIGHT, e.g. 1024x683")
+    }
+    return (parts[0], parts[1])
+}
+
+extension Data {
+    /// A length-prefixed UTF-8 string, tail-padded so whatever follows stays four-byte aligned.
+    /// The floats after it are read through `Float32Array`, which refuses an odd offset.
+    mutating func appendPaddedString(_ string: String) {
+        let bytes = Array(string.utf8)
+        appendInt32(Int32(bytes.count))
+        append(contentsOf: bytes)
+        append(contentsOf: [UInt8](repeating: 0, count: (4 - bytes.count % 4) % 4))
+    }
+}
+
+if let path = flags["--dump-scene-exposure"] {
+    guard let kelvin = options.sceneIlluminantKelvin else { fail("--scene-kelvin is required") }
+    var bytes = Data()
+    bytes.appendFloats(SpectralRuntime.sceneExposure(for: stock, cct: kelvin).values)
+    do { try bytes.write(to: URL(fileURLWithPath: path), options: .atomic) }
+    catch { fail("Could not write scene exposure table") }
+    exit(0)
+}
+
+if let packPath = flags["--dump-wasm-pack"] {
+    let (packWidth, packHeight) = packFrameSize()
+
+    // This export has no source image from which to measure a local tone base. Disable local tone
+    // and retain the invocation's identity grid.
+    options.localTone = false
+
+    let invocation = FilmEngineInvocation(stock: stock, options: options,
+                                          width: packWidth, height: packHeight)
+    let tables = invocation.spectral
+    let lutCount = tables.exposure.values.count
+
+    var pack = Data()
+    pack.append(contentsOf: Array("FSWP".utf8))
+    pack.appendUInt32(options.transportConstruction(for: stock) == nil ? 2 : 4)
+    pack.appendInt32(Int32(packWidth))
+    pack.appendInt32(Int32(packHeight))
+    pack.appendInt32(invocation.featureMask)
+    pack.appendUInt32(invocation.seed)
+    pack.appendInt32(Int32(invocation.configuration.count))
+    pack.appendInt32(Int32(tables.exposure.dimension))
+    pack.appendInt32(Int32(lutCount))
+    pack.appendInt32(tables.paperOutput == nil ? 0 : 1)
+    pack.appendFloats(invocation.configuration)
+    pack.appendFloats(tables.exposure.values)
+    pack.appendFloats(tables.filmOutput.values)
+    // A reversal stock prints nothing, and the kernel never samples the cube. It still has to be
+    // bound, so it goes across as zeros rather than as a missing buffer.
+    pack.appendFloats(tables.paperOutput?.values ?? [Float](repeating: 0, count: lutCount))
+
+    // The size ladder, new in version 2. Every spatial slot above is millimetres of emulsion
+    // times this frame's pixels per millimetre, so a pack sealed for 1600x900 would develop a
+    // 100-megapixel frame with grain and halation seven times too coarse. Rather than teach the
+    // browser the physics, the pack carries the slots that move — some 35 of the 8808 — for a
+    // ladder of short edges 3% apart, each sealed by the same code that sealed the base, along
+    // with the feature mask and the apron a tile needs at that size. The browser takes the
+    // nearest rung, which puts every spatial parameter within 1.5% of where a native render
+    // would put it. The short edge sets pixels per millimetre; the long edge follows the pack's
+    // own aspect so the rung at the pack's size is the pack.
+    let baseShortEdge = min(packWidth, packHeight)
+    let baseLongEdge = max(packWidth, packHeight)
+    var shortEdges: Set<Int> = [baseShortEdge]
+    var edge = 240.0
+    while edge <= 12288 {
+        shortEdges.insert(Int(edge.rounded()))
+        edge *= 1.03
+    }
+    let ladder = shortEdges.sorted()
+    pack.appendInt32(Int32(ladder.count))
+    var masks: Set<Int32> = [invocation.featureMask]
+    for shortEdge in ladder {
+        let longEdge = shortEdge == baseShortEdge
+            ? baseLongEdge : Int((Double(shortEdge) * Double(baseLongEdge) / Double(baseShortEdge)).rounded())
+        let rung = FilmEngineInvocation(stock: stock, options: options,
+                                        width: max(longEdge, shortEdge), height: shortEdge)
+        // Compared by bit pattern, as the stage sidecar does, so a signed zero or a NaN the
+        // engine writes the same way at every size stays unchanged.
+        var changed: [(Int32, Float)] = []
+        for (index, value) in rung.configuration.enumerated()
+        where value.bitPattern != invocation.configuration[index].bitPattern {
+            changed.append((Int32(index), value))
+        }
+        if shortEdge == baseShortEdge && !changed.isEmpty {
+            fail("The pack's own size moved \(changed.count) slots on the ladder.")
+        }
+        masks.insert(rung.featureMask)
+        pack.appendInt32(Int32(shortEdge))
+        pack.appendInt32(rung.featureMask)
+        pack.appendUInt32(rung.seed)
+        pack.appendInt32(Int32(rung.spatialSupport))
+        pack.appendInt32(Int32(changed.count))
+        for (index, value) in changed {
+            pack.appendInt32(index)
+            pack.appendFloats([value])
+        }
+    }
+
+    do {
+        if options.transportConstruction(for: stock) != nil {
+            let sizes = ladder.map { shortEdge in
+                (max(shortEdge, Int((Double(shortEdge) * Double(baseLongEdge) / Double(baseShortEdge)).rounded())),
+                 shortEdge)
+            }
+            do {
+                pack.append(try WebFilmProfile.transportSection(stock: stock, options: options,
+                                                                width: packWidth, height: packHeight,
+                                                                sizes: sizes))
+            } catch let failure as WebFilmProfile.Failure {
+                fail(failure.description)
+            }
+        }
+        // The film grain model's tiles close the pack, their count last so a reader finds them
+        // from the end: every rung samples the same film.
+        if let tiles = FilmGrain.registeredTiles(configuration: invocation.configuration) {
+            pack.appendFloats(tiles)
+            pack.appendInt32(Int32(tiles.count))
+        }
+        try pack.write(to: URL(fileURLWithPath: packPath))
+    } catch {
+        fail("Could not write \(packPath): \(error.localizedDescription)")
+    }
+    print("""
+    \(stockID) on \(options.paper(for: stock).id) at \(packWidth)x\(packHeight): \
+    \(pack.count / 1024) KiB, features 0x\(String(invocation.featureMask, radix: 16)), \
+    \(ladder.count) sizes from \(ladder.first ?? 0) to \(ladder.last ?? 0) px across \
+    \(masks.count) feature masks -> \(packPath)
+    """)
+    exit(0)
+}
+
+// The stage sidecar: the same export, once for each state in `stageSequence`, so a browser can
+// show what each part of the pipeline contributed.
+//
+// Sealing a whole pack per stage would cost a stage's worth of three colour cubes each — some
+// 20 MiB for one stock, nearly all of it repeated. Two things keep it small. A stage stores its
+// configuration as the slots that differ from the base pack, because switching off flare, halation,
+// couplers or grain moves a handful of the 8681 and leaves the rest alone. And the cubes are pooled:
+// the six stages developed before the H&D curve comes back all read the same straight-line film
+// cube, so it is written once and referenced. The reader rebuilds a stage from the base pack, the
+// slot differences, and whichever pooled cubes the stage names.
+if let stagesPath = flags["--dump-wasm-stages"] {
+    let (packWidth, packHeight) = packFrameSize()
+    // As in the single-pack export: no image here means no regional exposure to measure.
+    options.localTone = false
+
+    let stages = PipelineWalk.steps(stock: stock, options: options)
+    // The last stage is the film as it actually is, so its tables are the base every other stage is
+    // written as a difference from — and it is the pack the browser starts a fresh image with.
+    guard let base = stages.last.map({
+        FilmEngineInvocation(stock: $0.stock, options: $0.options,
+                             width: packWidth, height: packHeight)
+    }) else {
+        fail("The pipeline has no stages to export.")
+    }
+    let baseTables = base.spectral
+    let lutCount = baseTables.exposure.values.count
+    let emptyCube = [Float](repeating: 0, count: lutCount)
+    let basePaper = baseTables.paperOutput?.values ?? emptyCube
+
+    // The pool. A cube already in the base pack is index -1 and costs nothing; anything else is
+    // matched against what has been pooled so far, so an unchanged table is stored once however
+    // many stages read it.
+    var pool: [[Float]] = []
+    func poolIndex(_ cube: [Float], sameAsBase: [Float]) -> Int32 {
+        if cube == sameAsBase { return -1 }
+        if let existing = pool.firstIndex(of: cube) { return Int32(existing) }
+        pool.append(cube)
+        return Int32(pool.count - 1)
+    }
+
+    var records = Data()
+    for stage in stages {
+        let invocation = FilmEngineInvocation(stock: stage.stock, options: stage.options,
+                                              width: packWidth, height: packHeight)
+        let tables = invocation.spectral
+        let exposureCube = poolIndex(tables.exposure.values, sameAsBase: baseTables.exposure.values)
+        let filmCube = poolIndex(tables.filmOutput.values, sameAsBase: baseTables.filmOutput.values)
+        let paperCube = poolIndex(tables.paperOutput?.values ?? emptyCube, sameAsBase: basePaper)
+
+        // Compared by bit pattern rather than by value, so a slot the engine writes as a signed
+        // zero or a NaN still appears as unchanged when it is unchanged.
+        var changed: [(Int32, Float)] = []
+        for (index, value) in invocation.configuration.enumerated()
+        where value.bitPattern != base.configuration[index].bitPattern {
+            changed.append((Int32(index), value))
+        }
+
+        records.appendPaddedString(stage.id)
+        records.appendPaddedString(stage.label)
+        records.appendInt32(invocation.featureMask)
+        records.appendUInt32(invocation.seed)
+        records.appendInt32(exposureCube)
+        records.appendInt32(filmCube)
+        records.appendInt32(paperCube)
+        records.appendInt32(Int32(changed.count))
+        for (index, value) in changed {
+            records.appendInt32(index)
+            records.appendFloats([value])
+        }
+
+        let carried = [("exposure", exposureCube), ("film", filmCube), ("paper", paperCube)]
+            .filter { $0.1 >= 0 }.map { "\($0.0) #\($0.1)" }
+        print("  \(stage.id.padding(toLength: 14, withPad: " ", startingAt: 0))"
+            + "\(changed.count) slots  \(carried.isEmpty ? "-" : carried.joined(separator: ", "))")
+    }
+
+    var sidecar = Data()
+    sidecar.append(contentsOf: Array("FSSQ".utf8))
+    sidecar.appendUInt32(1)
+    sidecar.appendInt32(Int32(packWidth))
+    sidecar.appendInt32(Int32(packHeight))
+    sidecar.appendInt32(Int32(base.configuration.count))
+    sidecar.appendInt32(Int32(lutCount))
+    sidecar.appendInt32(Int32(stages.count))
+    sidecar.appendInt32(Int32(pool.count))
+    // Store the fixed-size cube pool after variable-length stage records so offsets are known after
+    // one record scan.
+    sidecar.append(records)
+    for cube in pool { sidecar.appendFloats(cube) }
+
+    do {
+        try sidecar.write(to: URL(fileURLWithPath: stagesPath))
+    } catch {
+        fail("Could not write \(stagesPath): \(error.localizedDescription)")
+    }
+    print("""
+    \(stockID) on \(options.paper(for: stock).id) at \(packWidth)x\(packHeight): \
+    \(stages.count) stages, \(pool.count) pooled cubes, \(sidecar.count / 1024) KiB \
+    -> \(stagesPath)
+    """)
+    exit(0)
+}
+
+let hlgOutput = flags["--hlg"] != nil
+// Eight bits of an HLG signal is banding, not a delivery: the curve spends its lower half on
+// the range sRGB gives its whole range to.
+let isTIFFOutput = ["tif", "tiff"].contains(URL(fileURLWithPath: positional[1])
+    .pathExtension.lowercased())
+// A Cineon scan is code values, not light: it goes to DPX, and nothing else does.
+let cineonOutput = options.paper(for: stock).deliversCodeValues
+let isDPXOutput = URL(fileURLWithPath: positional[1]).pathExtension.lowercased() == "dpx"
+if cineonOutput && !isDPXOutput && flags["--stages"] == nil {
+    fail("--paper cineon-log writes a 10-bit Cineon DPX: name a .dpx output")
+}
+if isDPXOutput && !cineonOutput {
+    fail("A .dpx output is a Cineon scan: add --paper cineon-log")
+}
+if cineonOutput && hlgOutput { fail("--hlg and --paper cineon-log cannot be combined") }
+let depth = hlgOutput ? 16 : (flags["--depth"].flatMap { Int($0) } ?? (isTIFFOutput ? 16 : 8))
+guard depth == 8 || depth == 16 else { fail("--depth must be 8 or 16") }
+let balance = WhiteBalance(
+    kelvin: flags["--wb"].flatMap { Float($0) } ?? WhiteBalance.neutralKelvin,
+    tint: flags["--tint"].flatMap { Float($0) } ?? 0)
+let background = parseLinearBackground(flags["--background"])
+
+let scene = loadLinear(path: positional[0])
+var rgba = scene.rgba
+var width = scene.width, height = scene.height
+let contentHeadroom = scene.contentHeadroom
+if flags["--edge"] != nil, let geometry = UnexposedEdge.Geometry.preset(options.format.presetID ?? "35mm") {
+    let margins = geometry.margins(photoWidth: width, photoHeight: height,
+                                   pixelsPerMM: options.pixelsPerMM(width: width, height: height),
+                                   carrier: !stock.isReversal)
+    let outer = (width + margins.left + margins.right, height + margins.top + margins.bottom)
+    var extended = [Float](repeating: 0, count: outer.0 * outer.1 * 4)
+    rgba.withUnsafeBufferPointer { source in extended.withUnsafeMutableBufferPointer {
+        UnexposedEdge.extend(source, width: width, height: height, margins: margins, into: $0) } }
+    let input = URL(fileURLWithPath: positional[0])
+    let aperture = UnexposedEdge.TakingAperture(
+        fNumber: flags["--f-number"].flatMap { Float($0) }, sensor: SensorFrame.read(url: input))
+        ?? UnexposedEdge.TakingAperture(contentsOf: input)
+    options.unexposedEdge = .init(margins: margins, fNumber: aperture?.equivalent(on: options.format))
+    rgba = extended; width = outer.0; height = outer.1
+}
+PremultipliedAlpha.flatten(&rgba, over: background)
+// RAW decoding keeps its as-shot white. All inputs then use the stock's native light unless
+// --scene-kelvin explicitly names a different source. --wb is the same relative edit on both.
+options.whiteBalance = balance
+// And the declared range, the other clip-side fact the app attaches: recorded light above
+// diffuse white is metered into the film's latitude instead of flattening to paper white.
+options.sceneHeadroom = contentHeadroom
+if flags["--autoexpose"] != nil {
+    let ev = autoExposureEV(rgba: rgba, width: width, height: height)
+    options.exposureEV += ev
+    print(String(format: "Auto exposure: %+.2f stops", ev))
+}
+
+guard FotufilmEngine.isHalideBackendAvailable else {
+    fail("""
+    The Halide engine is not linked into this build. Install Halide \
+    (brew install halide, or set HALIDE_ROOT) and rebuild.
+    """)
+}
+
+let start = Date()
+// Unclamped: a component the ingest matrix leaves negative is real colour beyond Rec.2020 —
+// a laser, an LED, a gas discharge — on its way to the spectral recovery, which is the one
+// place on the scene path that decides what light is. Zeroing it here developed every such
+// source as its per-channel clip. Only a non-finite sample, which a decoder can emit on a
+// failed frame, is replaced, and by darkness rather than by a channel.
+var linear = ImageBuffer(width: width, height: height)
+for i in 0..<(width * height) {
+    for channel in 0..<3 {
+        let value = rgba[i * 4 + channel]
+        linear.planes[channel][i] = value.isFinite ? value : 0
+    }
+}
+
+if flags["--stages"] != nil {
+    // The stage sequence is a diagnostic written as SDR PNGs; there is no HLG stage to write,
+    // and silently ignoring the flag would be worse than saying so.
+    if hlgOutput { fail("--hlg and --stages cannot be combined") }
+    writeStageSequence(linear: linear, alpha: rgba, stock: stock, options: options,
+                       directory: positional[1], depth: depth)
+    exit(0)
+}
+let out: ImageBuffer
+do { out = try FotufilmEngine(stock: stock, options: options).processChecked(linearRGB: linear) }
+catch { fail("Render failed: \(error.localizedDescription)") }
+var reflectance = [Float](repeating: 1, count: width * height * 4)
+for i in 0..<(width * height) {
+    reflectance[i * 4] = out.planes[0][i]
+    reflectance[i * 4 + 1] = out.planes[1][i]
+    reflectance[i * 4 + 2] = out.planes[2][i]
+    reflectance[i * 4 + 3] = rgba[i * 4 + 3]
+}
+let elapsed = Date().timeIntervalSince(start)
+if cineonOutput {
+    let film = CineonDPX.Film(frameRate: options.format.isMotionPicture ? 24 : nil,
+                              format: options.format.name, stock: stock.name)
+    let data = reflectance.withUnsafeBufferPointer {
+        CineonDPX.encode(signals: $0, width: width, height: height, film: film)
+    }
+    do { try data.write(to: URL(fileURLWithPath: positional[1])) }
+    catch { fail("Could not write: \(positional[1])") }
+} else if hlgOutput {
+    saveHLG(reflectance, width: width, height: height, path: positional[1])
+} else {
+    saveReflectance(reflectance, width: width, height: height, path: positional[1],
+                    depth: depth, seed: options.seed,
+                    shoulderKnee: options.sdrShoulderKnee(for: stock))
+}
+print("Processed \(width)x\(height) with \(stock.name) (halide) in \(String(format: "%.2f", elapsed))s -> \(positional[1])")
+if benchmarkIterations > 1 {
+    let count = benchmarkIterations
+    print("Benchmarking steady-state across \(count) iterations (warmup: \(String(format: "%.3f", elapsed))s)...")
+    var times = [Double]()
+    for iter in 2...count {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        do { _ = try FotufilmEngine(stock: stock, options: options).processChecked(linearRGB: linear) }
+        catch { fail("Benchmark run \(iter) failed: \(error.localizedDescription)") }
+        let dt = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000
+        times.append(dt)
+        print(String(format: "  Run %d: %.3fs (%.1f ms)", iter, dt, dt * 1000))
+    }
+    let avg = times.reduce(0, +) / Double(times.count)
+    let minT = times.min() ?? 0
+    print(String(format: "Steady-state (runs 2..%d): avg %.3fs (%.1f ms), min %.3fs (%.1f ms)", count, avg, avg * 1000, minT, minT * 1000))
+    let sorted = times.sorted()
+    let median = sorted.count % 2 == 0
+        ? (sorted[sorted.count/2-1] + sorted[sorted.count/2]) / 2 : sorted[sorted.count/2]
+    let p95 = sorted[max(0, Int(ceil(Double(sorted.count)*0.95))-1)]
+    print(String(format: "Median %.1f ms, p95 %.1f ms, throughput %.2f fps; 30 fps budget 33.33 ms/frame",
+                 median*1000, p95*1000, 1/avg))
+}
+#else
+fail("Image I/O requires macOS (ImageIO). The FotufilmCore library itself is portable.")
+#endif

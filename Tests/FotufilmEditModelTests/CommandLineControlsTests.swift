@@ -1,0 +1,80 @@
+import XCTest
+import FotufilmCore
+@testable import FotufilmEditModel
+
+final class CommandLineControlsTests: XCTestCase {
+    private func applying(_ field: EditorControlField, _ text: String) throws -> FotufilmEngine.Options {
+        var options = FotufilmEngine.Options()
+        try XCTUnwrap(EditorControlCatalogue.control(field)).applyCommandLineValue(text, to: &options)
+        return options
+    }
+
+    func testScreenStylesReachTheEngineAndRejectUnknownValues() throws {
+        XCTAssertEqual(FotufilmEngine.Options().digitalReference, .autoLevels)
+        for style in DigitalReferenceStyle.allCases {
+            XCTAssertEqual(try applying(.digitalReference, style.rawValue).digitalReference, style)
+        }
+        XCTAssertThrowsError(try applying(.digitalReference, "unknown"))
+        XCTAssertEqual(try applying(.screenGrade, "3.5").screenGrade, 3.5)
+        XCTAssertEqual(try applying(.screenExposure, "-1.5").screenExposureEV, -1.5)
+    }
+
+    func testReceiverBandFlagsPlaceEachPeakAndRejectOutOfRange() throws {
+        XCTAssertEqual(FotufilmEngine.Options().receiverBands, .paper)
+        XCTAssertEqual(try applying(.screenRedBand, "630").receiverBands,
+                       ReceiverBands(red: 630, green: 545, blue: 470))
+        XCTAssertEqual(try applying(.screenGreenBand, "525").receiverBands.green, 525)
+        XCTAssertEqual(try applying(.screenBlueBand, "455").receiverBands.blue, 455)
+        for invalid in ["599", "741", "nan"] {
+            XCTAssertThrowsError(try applying(.screenRedBand, invalid))
+        }
+    }
+
+    func testCMYFlagsReachIndependentChannelsAndRejectInvalidValues() throws {
+        for (channel, field) in [EditorControlField.screenCyan, .screenMagenta, .screenYellow].enumerated() {
+            var expected = SIMD3<Float>.zero
+            expected[channel] = -0.25
+            XCTAssertEqual(try applying(field, "-0.25").screenCMY, expected)
+            for invalid in ["-1.01", "1.01", "nan", "inf"] {
+                XCTAssertThrowsError(try applying(field, invalid))
+            }
+        }
+    }
+
+    func testPrinterLightFlagsReachTheirOwnBeamAndRejectOffScaleValues() throws {
+        XCTAssertEqual(FotufilmEngine.Options().printerLights, .balanced)
+        for (channel, field) in [EditorControlField.printerRed, .printerGreen, .printerBlue].enumerated() {
+            var expected = PrinterLights.balanced
+            expected[channel] = 31
+            XCTAssertEqual(try applying(field, "31").printerLights, expected)
+            for invalid in ["0", "51", "nan", "inf"] {
+                XCTAssertThrowsError(try applying(field, invalid), invalid)
+            }
+        }
+    }
+
+    func testFringeFlagsKeepTheirExistingLimits() throws {
+        for value in ["-0.1", "1.1", "nan", "inf", "1e300"] {
+            XCTAssertThrowsError(try applying(.chromaticFringeAmount, value), value)
+        }
+        for value in ["-1", "2001", "nan", "inf"] {
+            XCTAssertThrowsError(try applying(.chromaticFringeRadius, value), value)
+        }
+        XCTAssertEqual(try applying(.chromaticFringeAmount, "0").chromaticFringeAmount, 0)
+        XCTAssertEqual(try applying(.chromaticFringeAmount, "1").chromaticFringeAmount, 1)
+        // The CLI's published range extends beyond the plugin slider's 300 µm.
+        XCTAssertEqual(try applying(.chromaticFringeRadius, "2000").chromaticFringeRadiusMM, 2)
+    }
+
+    func testFlagUnitsAndChoicesReachTheIntendedOptions() throws {
+        XCTAssertEqual(try applying(.exposure, "-1.5").exposureEV, -1.5)
+        XCTAssertEqual(try applying(.halation, "0.5").halationScale, 0.5)
+        XCTAssertEqual(try applying(.couplerReach, "2").couplerGapReachScales, [2, 2])
+        XCTAssertEqual(try applying(.couplerSelf, "0").couplerSelfScale, 0)
+        XCTAssertEqual(try applying(.halationModel, "layered").halationModel, .layered)
+        XCTAssertEqual(try applying(.enlarger, "condenser").enlarger, .condenser)
+        XCTAssertTrue(try applying(.estimatedHalation, "").useEstimatedHalationProfile)
+        XCTAssertFalse(try applying(.localTone, "0").localTone)
+        XCTAssertThrowsError(try applying(.halationModel, "unknown"))
+    }
+}

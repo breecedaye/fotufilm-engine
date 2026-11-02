@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Exercise default resource packaging and reject extra, nested or missing film profiles."""
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('verify_profiles', root / 'tools/verify-film-profiles.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory() as temporary:
+    resources = Path(temporary) / 'Resources'
+    env = {k: v for k, v in os.environ.items() if not k.startswith('FOTUFILM_')}
+    subprocess.run(['bash', 'tools/copy-shipping-resources.sh', str(resources)],
+                   cwd=root, env=env, check=True)
+    stocks = resources / 'Stocks'
+    assert len(module.STOCKS) == 47
+    module.verify(stocks)
+    assert not list(resources.glob('*.fotufilmpack'))
+    subprocess.run(['bash', 'tools/audit-apple-bundle.sh', str(resources)],
+                   cwd=root, env=env, check=True)
+    for name, contents in [('extra.json', b'{}'), ('nested/trace.csv', b'1,2,3')]:
+        path = stocks / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(contents)
+        try:
+            module.verify(stocks)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted an unexpected film profile entry: {name}')
+        path.unlink()
+        if path.parent != stocks:
+            path.parent.rmdir()
+    missing = stocks / 'superia200.json'
+    original_missing = missing.read_bytes()
+    missing.unlink()
+    try:
+        module.verify(stocks)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('accepted a missing released profile')
+    missing.write_bytes(original_missing)
+    module.verify(stocks)
+    (resources / 'fotufilm.fotufilmpack').write_bytes(b'old catalogue pack')
+    result = subprocess.run(['bash', 'tools/audit-apple-bundle.sh', str(resources)],
+                            cwd=root, env=env, capture_output=True)
+    assert result.returncode != 0, 'accepted a film pack in the bundle'
+print('Film profile packaging regression checks passed.')

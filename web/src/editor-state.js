@@ -1,0 +1,430 @@
+import {
+  parsePrintFrame,
+  parsePrintFrameCamera,
+  parsePrintFrameCount,
+  parsePrintFrameEdgePrinting,
+  parsePrintFrameFraming,
+  parsePrintFrameMargin,
+  parsePrintFrameNumber,
+} from "./print-frame.js";
+import { defaultLens, parseLensCorrection } from "./lens-correction.js";
+import { parseLensFilters } from "./lens-filters.js";
+import { parseProfileSettings } from "./profile-settings.js";
+import { VIDEO_ENCODINGS } from "./video-color.js";
+import { catalogueSlider, editorControl } from "./editor-catalogue.js";
+import { selectionKeys } from "./selective.js";
+import { parseNegative } from "./negative-document.js";
+export const SLIDERS = [
+  catalogueSlider("cameraPreflash", "Light", 0.005),
+  catalogueSlider("sceneLightKelvin", "Source Illuminant", 1),
+  {
+    key: "ev",
+    label: "Exposure",
+    min: -3,
+    max: 3,
+    step: 0.05,
+    def: 0,
+    unit: "EV",
+    group: "Light",
+  },
+  {
+    key: "highlights",
+    label: "Highlights",
+    min: -1,
+    max: 1,
+    step: 0.01,
+    def: 0,
+    group: "Light",
+  },
+  {
+    key: "shadows",
+    label: "Shadows",
+    min: -1,
+    max: 1,
+    step: 0.01,
+    def: 0,
+    group: "Light",
+  },
+  {
+    key: "temperature",
+    label: "Temperature",
+    min: 2000,
+    max: 12000,
+    step: 1,
+    def: 6504,
+    unit: "K",
+    group: "White Balance",
+  },
+  {
+    key: "tint",
+    label: "Tint",
+    min: -100,
+    max: 100,
+    step: 1,
+    def: 0,
+    group: "White Balance",
+  },
+  {
+    key: "saturation",
+    label: "Saturation",
+    min: 0,
+    max: 2,
+    step: 0.01,
+    def: 1,
+    unit: "×",
+    group: "Color",
+  },
+  {
+    key: "vibrance",
+    label: "Vibrance",
+    min: -1,
+    max: 1,
+    step: 0.01,
+    def: 0,
+    group: "Color",
+  },
+  {
+    key: "grain",
+    label: "Grain",
+    min: 0,
+    max: 2,
+    step: 0.01,
+    def: 1,
+    unit: "×",
+    group: "Character",
+  },
+  ...["Shadows", "Midtones", "Highlights"].flatMap((band) =>
+    ["Warmth", "Tint", "Level"].map((axis) => ({
+      key: `grade${band}${axis}`,
+      label: axis,
+      min: -1,
+      max: 1,
+      step: 0.01,
+      def: 0,
+      group: band,
+    })),
+  ),
+];
+export const fullCrop = () => [
+  [0, 0],
+  [1, 0],
+  [1, 1],
+  [0, 1],
+];
+export const defaultEdit = (stock = null) => ({
+  stock,
+  format: null,
+  profile: {},
+  filters: [],
+  lens: defaultLens(),
+  filterMetering: "throughTheLens",
+  medium: null,
+  // Match Film: the medium follows the film, to each film's own, as the Mac app's does.
+  mediumFollowsFilm: false,
+  // RAW Corrections, which the native decoders apply; the browser's decoder corrects nothing.
+  rawCorrections: true,
+  printFrame: "none",
+  printFrameMargin: 1,
+  printFrameEdgePrinting: true,
+  printFrameNumber: 1,
+  printFrameFraming: [0, 0],
+  printFrameCount: 1,
+  printFrameCamera: "panoramic",
+  digitalReference: "auto-levels",
+  // `frameRate` is the clip's cadence, the rate it exports at; null keeps the source's.
+  video: { encoding: "standard", trimStart: 0, trimEnd: null, audio: true, frameRate: null },
+  halationModel: "legacy",
+  sceneLight: "unspecified",
+  selective: null,
+  params: Object.fromEntries(SLIDERS.map((s) => [s.key, s.def])),
+  gradeSpace: false,
+  localTone: true,
+  seed: 0,
+  rotation: 0,
+  flip: false,
+  straighten: 0,
+  perspectiveV: 0,
+  perspectiveH: 0,
+  cropShape: "rectangle",
+  crop: fullCrop(),
+  ratio: "free",
+  // Set on a scanned negative (negative-document.js).
+  negative: null,
+});
+export const initialHistory = {
+  past: [],
+  present: defaultEdit(),
+  future: [],
+  group: null,
+};
+export function historyReducer(state, action) {
+  if (action.type === "restore") return action.history;
+  if (action.type === "load")
+    return { past: [], present: action.edit, future: [], group: null };
+  if (action.type === "end") return { ...state, group: null };
+  // A change the app made for the photograph (a suggested film), not a step to undo.
+  if (action.type === "replace")
+    return { ...state, present: { ...state.present, ...action.patch } };
+  if (action.type === "undo") {
+    if (!state.past.length) return state;
+    return {
+      past: state.past.slice(0, -1),
+      present: state.past.at(-1),
+      future: [state.present, ...state.future],
+      group: null,
+    };
+  }
+  if (action.type === "redo") {
+    if (!state.future.length) return state;
+    return {
+      past: [...state.past, state.present],
+      present: state.future[0],
+      future: state.future.slice(1),
+      group: null,
+    };
+  }
+  // A step of the Edit History: the timeline stays whole, as a run of undos or redos would
+  // leave it.
+  if (action.type === "goTo") {
+    const states = [...state.past, state.present, ...state.future];
+    const index = action.index;
+    if (!Number.isInteger(index) || index < 0 || index >= states.length)
+      return state;
+    if (index === state.past.length) return state;
+    return {
+      past: states.slice(0, index),
+      present: states[index],
+      future: states.slice(index + 1),
+      group: null,
+    };
+  }
+  if (action.type === "edit") {
+    const next = { ...state.present, ...action.patch };
+    if (JSON.stringify(next) === JSON.stringify(state.present)) return state;
+    const grouped = action.group && state.group === action.group;
+    return {
+      past: grouped ? state.past : [...state.past.slice(-99), state.present],
+      present: next,
+      future: [],
+      group: action.group || null,
+    };
+  }
+  return state;
+}
+export function validCrop(points) {
+  return (
+    Array.isArray(points) &&
+    points.length === 4 &&
+    points.every(
+      (p) =>
+        Array.isArray(p) &&
+        p.length === 2 &&
+        p.every((v) => Number.isFinite(v) && v >= 0 && v <= 1),
+    ) &&
+    points.every((a, i) => {
+      const b = points[(i + 1) % 4],
+        c = points[(i + 2) % 4];
+      return (
+        (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) > 0.0001
+      );
+    })
+  );
+}
+export function rotatedCrop(crop, mirrored = false) {
+  return mirrored
+    ? [crop[3], crop[0], crop[1], crop[2]].map(([x, y]) => [1 - y, x])
+    : [crop[1], crop[2], crop[3], crop[0]].map(([x, y]) => [y, 1 - x]);
+}
+export const flippedCrop = (crop) =>
+  [crop[1], crop[0], crop[3], crop[2]].map(([x, y]) => [1 - x, y]);
+export function cropForRatio(ratio, width, height) {
+  if (ratio === "free" || ratio === "original") return fullCrop();
+  const [a, b] = ratio.split(":").map(Number);
+  const target = a / b,
+    aspect = width / height;
+  const w = Math.min(1, target / aspect),
+    h = Math.min(1, aspect / target);
+  return [
+    [(1 - w) / 2, (1 - h) / 2],
+    [(1 + w) / 2, (1 - h) / 2],
+    [(1 + w) / 2, (1 + h) / 2],
+    [(1 - w) / 2, (1 + h) / 2],
+  ];
+}
+export function parseEdit(json, stockIDs) {
+  const saved = JSON.parse(json);
+  if (saved.version !== 1 || !saved.edit)
+    throw new Error("Unsupported edit file.");
+  const edit = saved.edit,
+    base = defaultEdit(edit.stock);
+  if (edit.stock !== null && !stockIDs.includes(edit.stock))
+    throw new Error("The film in this edit is not installed.");
+  const negative = parseNegative(edit.negative);
+  if (
+    !edit.params ||
+    !SLIDERS.every(
+      (s) =>
+        Number.isFinite(
+          edit.params[s.key] ??
+            (["cameraPreflash", "sceneLightKelvin"].includes(s.key)
+              ? s.def
+              : NaN),
+        ) &&
+        (edit.params[s.key] ?? s.def) >= s.min &&
+        (edit.params[s.key] ?? s.def) <= s.max,
+    )
+  )
+    throw new Error("Invalid adjustment values.");
+  if (
+    edit.sceneLight != null &&
+    !editorControl("sceneLight").choices.some((c) => c.id === edit.sceneLight)
+  )
+    throw new Error("Invalid source illuminant.");
+  if (edit.selective != null) {
+    const local = edit.selective;
+    if (
+      !["color", "light", "subject"].includes(local.kind) ||
+      typeof local.localTone !== "boolean" ||
+      typeof local.gradeSpace !== "boolean" ||
+      !Number.isFinite(local.range) ||
+      local.range < 0.05 ||
+      local.range > 0.6 ||
+      !Number.isFinite(local.softness) ||
+      local.softness < 0.05 ||
+      local.softness > 1 ||
+      (local.subjectEdge != null &&
+        !(Math.abs(local.subjectEdge) <= 1)) ||
+      (local.subjectFeather != null &&
+        !(local.subjectFeather >= 0 && local.subjectFeather <= 1)) ||
+      (local.point !== null &&
+        (!Array.isArray(local.point) ||
+          local.point.length !== 2 ||
+          !local.point.every((v) => Number.isFinite(v) && v >= 0 && v <= 1))) ||
+      (local.sample !== null &&
+        (!Array.isArray(local.sample) ||
+          local.sample.length !== 3 ||
+          !local.sample.every(Number.isFinite))) ||
+      (local.point === null) !== (local.sample === null) ||
+      !local.params ||
+      !selectionKeys.every((key) => {
+        const slider = SLIDERS.find((s) => s.key === key),
+          value = local.params[key];
+        return (
+          Number.isFinite(value) && value >= slider.min && value <= slider.max
+        );
+      })
+    )
+      throw new Error("Invalid selective adjustments.");
+  }
+  if (
+    edit.video != null &&
+    (!VIDEO_ENCODINGS.some((item) => item.id === edit.video.encoding) ||
+      !Number.isFinite(edit.video.trimStart) ||
+      edit.video.trimStart < 0 ||
+      (edit.video.trimEnd !== null &&
+        (!Number.isFinite(edit.video.trimEnd) ||
+          edit.video.trimEnd <= edit.video.trimStart)) ||
+      typeof edit.video.audio !== "boolean" ||
+      (edit.video.frameRate != null &&
+        (!Number.isFinite(edit.video.frameRate) ||
+          edit.video.frameRate <= 0 ||
+          edit.video.frameRate > 240)))
+  )
+    throw new Error("Invalid video settings.");
+  if (
+    edit.digitalReference != null &&
+    !["reference-exposure", "graded-print", "auto-levels"].includes(
+      edit.digitalReference,
+    )
+  )
+    throw new Error("Invalid screen conversion.");
+  if (
+    edit.medium != null &&
+    (typeof edit.medium !== "string" || !/^[a-z0-9-]+$/.test(edit.medium))
+  )
+    throw new Error("Invalid output medium.");
+  if (edit.mediumFollowsFilm != null && typeof edit.mediumFollowsFilm !== "boolean")
+    throw new Error("Invalid output medium.");
+  if (
+    edit.halationModel != null &&
+    !["legacy", "layered"].includes(edit.halationModel)
+  )
+    throw new Error("Invalid halation model.");
+  for (const key of ["perspectiveV", "perspectiveH"]) {
+    const value = edit[key] ?? 0;
+    if (!Number.isFinite(value) || value < -15 || value > 15)
+      throw new Error("Invalid perspective correction.");
+  }
+  if (
+    edit.cropShape != null &&
+    !["rectangle", "corners"].includes(edit.cropShape)
+  )
+    throw new Error("Invalid crop shape.");
+  if (
+    !validCrop(edit.crop) ||
+    (edit.cropShape === "rectangle" &&
+      (edit.crop[0][0] !== edit.crop[3][0] ||
+        edit.crop[1][0] !== edit.crop[2][0] ||
+        edit.crop[0][1] !== edit.crop[1][1] ||
+        edit.crop[2][1] !== edit.crop[3][1])) ||
+    ![0, 1, 2, 3].includes(edit.rotation) ||
+    typeof edit.flip !== "boolean" ||
+    typeof edit.gradeSpace !== "boolean" ||
+    typeof edit.localTone !== "boolean" ||
+    !Number.isFinite(edit.straighten) ||
+    Math.abs(edit.straighten) > 15 ||
+    !Number.isInteger(edit.seed) ||
+    edit.seed < 0 ||
+    edit.seed > 0xffffffff ||
+    ![
+      "free",
+      "original",
+      "1:1",
+      "4:5",
+      "5:4",
+      "3:2",
+      "2:3",
+      "4:3",
+      "3:4",
+      "16:9",
+      "9:16",
+    ].includes(edit.ratio)
+  )
+    throw new Error("Invalid frame settings.");
+  return {
+    ...base,
+    ...Object.fromEntries(Object.keys(base).map((key) => [key, edit[key]])),
+    ...parseProfileSettings(edit),
+    ...parseLensFilters(edit),
+    lens: parseLensCorrection(edit.lens),
+    perspectiveV: edit.perspectiveV ?? 0,
+    perspectiveH: edit.perspectiveH ?? 0,
+    cropShape: edit.cropShape ?? "corners",
+    medium: edit.medium ?? null,
+    mediumFollowsFilm: edit.mediumFollowsFilm === true,
+    rawCorrections: edit.rawCorrections !== false,
+    printFrame: parsePrintFrame(edit.printFrame),
+    printFrameMargin: parsePrintFrameMargin(edit.printFrameMargin),
+    printFrameEdgePrinting: parsePrintFrameEdgePrinting(edit.printFrameEdgePrinting),
+    printFrameNumber: parsePrintFrameNumber(edit.printFrameNumber),
+    printFrameFraming: parsePrintFrameFraming(edit.printFrameFraming),
+    printFrameCount: parsePrintFrameCount(edit.printFrameCount),
+    printFrameCamera: parsePrintFrameCamera(edit.printFrameCamera),
+    digitalReference: edit.digitalReference ?? "auto-levels",
+    video: edit.video ? { ...base.video, ...edit.video } : base.video,
+    halationModel: edit.halationModel ?? "legacy",
+    sceneLight: edit.sceneLight ?? "unspecified",
+    selective: edit.selective
+      ? {
+          ...edit.selective,
+          params: Object.fromEntries(
+            selectionKeys.map((key) => [key, edit.selective.params[key]]),
+          ),
+        }
+      : null,
+    params: Object.fromEntries(
+      SLIDERS.map((s) => [s.key, edit.params[s.key] ?? s.def]),
+    ),
+    negative,
+  };
+}

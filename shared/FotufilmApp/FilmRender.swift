@@ -1,0 +1,2307 @@
+import CoreGraphics
+import CoreImage
+import Foundation
+import ImageIO
+import Metal
+import UniformTypeIdentifiers
+
+#if canImport(FotufilmCore)
+import FotufilmCore
+#endif
+#if canImport(FotufilmMetal)
+import FotufilmMetal
+#endif
+#if canImport(FotufilmImaging)
+import FotufilmImaging
+#endif
+#if canImport(FotufilmEditModel)
+import FotufilmEditModel
+#endif
+
+/// App-supplied development for an existing scene. Implementations may receive concurrent
+/// requests, and must throw for unsupported work: an installed backend is never a fallback hint.
+protocol FilmRenderDetailContext: Sendable {}
+
+protocol FilmRenderBackend: AnyObject, Sendable {
+    func sceneStorage(byteCount: Int) -> MappedBuffer.StoragePreference
+    func spatialSupport(for invocation: FilmEngineInvocation) throws -> Int
+    func detailMeasurements(of scene: FilmRender.Scene, state: EditState,
+                            negative: NegativeViewing?) throws -> any FilmRenderDetailContext
+    func develop(_ request: FilmRender.DevelopmentRequest) throws -> FilmRender.DevelopmentOutput
+    func developRegion(_ request: FilmRender.DevelopmentRequest) throws -> FilmRender.RegionOutput
+}
+
+extension FilmRenderBackend {
+    func sceneStorage(byteCount: Int) -> MappedBuffer.StoragePreference { .automatic }
+}
+
+/// The scene-referred still pipeline.
+enum FilmRender {
+    /// One measured step of a render, for the progress UI.
+    enum Stage: String, CaseIterable, Identifiable, Sendable {
+        case decode, geometry, rasterize, glare, develop, encode
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .decode: return "Preparing"
+            case .geometry: return "Sizing"
+            case .rasterize: return "Applying Film"
+            case .glare: return "Adding Glow"
+            case .develop: return "Developing"
+            case .encode: return "Finishing"
+            }
+        }
+    }
+
+    enum Event: Sendable {
+        case began(Stage, detail: String)
+        case advanced(Stage, fraction: Double, detail: String)
+        case finished(Stage, duration: TimeInterval)
+    }
+
+    typealias Reporter = @Sendable (Event) -> Void
+    typealias DevelopmentOutput = (image: Rendered, histogram: [[Float]]?, hdrHistogram: [[Float]]?)
+
+    /// The existing develop contract, without exposing a particular engine or GPU resource type.
+    /// State is already the caller's chosen rendering state; negative is an explicit view override.
+    struct DevelopmentRequest {
+        let scene: Scene
+        let state: EditState
+        let detailMeasurements: DetailMeasurements?
+        let collectHistogram: Bool
+        let hdr: Bool
+        let dynamicRange: AppSettings.DynamicRange
+        let exact: Bool
+        let stock: FilmStock?
+        let negative: NegativeViewing?
+        let report: Reporter?
+        let shouldContinue: (() -> Bool)?
+    }
+
+    /// Only the apron-free image is publishable. Its viewport retains the virtual-frame origin
+    /// and density used to form it; callers must not crop this image a second time.
+    struct RegionOutput {
+        let rendered: Rendered
+        let viewport: PreviewViewport
+    }
+
+    private final class BackendRegistry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var backend: (any FilmRenderBackend)?
+
+        func install(_ value: (any FilmRenderBackend)?) {
+            lock.lock()
+            backend = value
+            lock.unlock()
+        }
+
+        func current() -> (any FilmRenderBackend)? {
+            lock.lock()
+            defer { lock.unlock() }
+            return backend
+        }
+    }
+    private static let backendRegistry = BackendRegistry()
+
+    /// Nil preserves the built-in renderer. Installing a backend makes its failures explicit;
+    /// unsupported requests must not quietly run through another renderer.
+    static func installDevelopmentBackend(_ backend: (any FilmRenderBackend)?) {
+        backendRegistry.install(backend)
+    }
+
+    private static let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)!
+    fileprivate static let outputSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+
+    /// BT.2020 with the HLG transfer.
+    static let hdrSpace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)
+
+    private static let context = CIContext(options: [
+        .workingColorSpace: linearSpace,
+        .workingFormat: CIFormat.RGBAf,
+        .cacheIntermediates: false,
+    ])
+
+    /// Resident footprint and remaining allowance, for the progress rows.
+    static func memoryNote() -> String {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return "" }
+        let used = Double(info.phys_footprint) / 1e6
+        #if os(iOS)
+        let free = Double(os_proc_available_memory()) / 1e6
+        return String(format: "%.0f MB used · %.0f MB free", used, free)
+        #else
+        return String(format: "%.0f MB used", used)
+        #endif
+    }
+
+    /// Everything a scene buffer depends on.
+    struct SceneKey: Equatable {
+        var rotation: Int
+        var flipH: Bool
+        var straighten: Double
+        var perspectiveV: Double
+        var perspectiveH: Double
+        var crop: CGRect?
+        var cornerCrop: QuadrilateralCrop?
+        var framingZoom: Double
+        var longEdge: Int?
+        var viewport: PreviewViewport? = nil
+        /// Camera RAW is decoded at the same fixed illuminant as its live/video acquisition.
+        var captureIlluminantKelvin: Double?
+        /// Everything about the lens correction that changes the pixels. It belongs in the key
+        /// because the correction happens on the way into the scene, so a cached scene made with a
+        /// different one is the wrong picture rather than a stale-looking one.
+        var lens: EditState.LensSettings
+        /// A scanned negative's reading — its clear film, light frame, roll and the cleaning kept
+        /// with it — and whether it prints plain, in Normal. A scan's scene is evened, cleaned and
+        /// measured by these, and in Normal printed by them, so a scene kept across a change to one
+        /// develops the reading it was made with. Nil and false for a photograph.
+        var negative: WebNativeEdit.Negative?
+        var printsPlain: Bool
+        /// RAW Corrections, which decide the decode itself.
+        var rawCorrections: Bool
+
+        init(state: EditState, longEdge: Int?,
+             viewport: PreviewViewport? = nil) {
+            rotation = state.rotation
+            flipH = state.flipH
+            straighten = state.straighten
+            perspectiveV = state.perspectiveV
+            perspectiveH = state.perspectiveH
+            crop = state.crop
+            cornerCrop = state.cornerCrop
+            framingZoom = state.framingZoom
+            self.longEdge = longEdge
+            self.viewport = viewport
+            captureIlluminantKelvin = state.captureIlluminantKelvin
+            lens = state.lensSettings
+            negative = state.negative
+            printsPlain = state.negative != nil && !state.hasFilm
+            rawCorrections = state.rawCorrections
+        }
+    }
+
+    /// The photograph as the emulsion receives it: scene-linear, placed, and
+    /// at the resolution it will be developed at.
+    struct Scene: @unchecked Sendable {
+        /// File-backed above a threshold, because this is both the largest thing a render holds and
+        /// the longest-lived — it survives a whole slider drag — while the develop only ever reads
+        /// a strip of it.
+        var pixels: MappedBuffer
+        var width: Int
+        var height: Int
+        var key: SceneKey
+        /// Capture light, preserved independently of edits. A camera capture names it for RAW
+        /// and processed files; imported RAW carries the decoder's original Kelvin and xy.
+        var sceneKelvin: Float?
+        var sceneChromaticity: SIMD2<Float>? = nil
+        /// The light the decode recovered above display white, as a multiple of it: above 1 exactly
+        /// when a gain map was expanded (`.expandToHDR`), 1 for every SDR source — and for raw,
+        /// whose above-white radiance has always been the negative's own path and is not rolled.
+        var contentHeadroom: Float = 1
+        /// How this scene was prepared for the engine. The policy itself lives in FotufilmCore so
+        /// non-app clients can select a built-in converter or supply their own.
+        var inputConversion: FilmInputConversion = .preserveHDR
+        /// Fraction of the film frame's short edge these pixels span — under 1 exactly when the
+        /// geometry cropped, so the develop can hold grain and the other millimetre-sized
+        /// structures at film scale rather than buffer scale (`Options.frameCoverage`).
+        var frameCoverage: Float = 1
+        /// Regional preview geometry. Nil means this scene is the complete placed frame.
+        var viewport: PreviewViewport?
+        /// The frame the camera exposed, where the file measured it. Read once here, with the rest
+        /// of what the file says about itself, because the develop settles the gauge from it and a
+        /// develop runs many times over one scene.
+        var sensorFrame: SensorFrame?
+        /// The aperture the file says the lens was set to, with the frame it was set on. Kept on
+        /// the camera's own path too, where `sensorFrame` is not, because the Emulsion Border's
+        /// gate shadow follows the lens whichever gauge the picture develops on.
+        var takingAperture: UnexposedEdge.TakingAperture?
+        /// Set only while the rasterise is still running behind this scene; nil once the pixels
+        /// are all there, which is every scene the editor holds between renders.
+        var ready: RowWatermark?
+        /// Places an upright original-coordinate subject mask on this scene's pixel lattice.
+        var placeSelectionMask: ((CIImage) -> CIImage)? = nil
+        /// Set on a piece of film larger than the aperture (`developFilm(beyond:...)`): where the
+        /// photograph stands in it, and the levels it prints on.
+        var unexposedEdge: UnexposedEdge.Develop? = nil
+        /// Set on a scanned negative's scene: what its whole framing measures, which a film reads
+        /// the scan by (`NegativeDocument.reading`). The pixels are then the framed scan, linear
+        /// Rec. 2020, except in Normal, where they are already its plain positive.
+        var scanMeasure: NegativeDocument.Measure? = nil
+
+        /// Blocks until `rows` have been laid down. Free — not even a lock — on a settled scene.
+        func waitForRows(through row: Int) {
+            ready?.wait(through: row)
+        }
+
+        /// The scene as full-precision samples, whole: a scene still being
+        /// laid down is waited for first, so no caller can read a row that has not been written.
+        func withPixels<R>(_ body: (UnsafeBufferPointer<Float>) -> R) -> R {
+            waitForRows(through: height)
+            return withPixelsWhileFilling(body)
+        }
+
+        /// The part of the scene `crop` keeps, in its pixels from the top left: what a film
+        /// border shows of a photograph of another shape (`PrintFramePlacement.photoCrop`).
+        func cropped(to crop: PrintFramePlacement.Rect) -> Scene? {
+            let x = Int(crop.x), y = Int(crop.y), w = Int(crop.width), h = Int(crop.height)
+            guard x >= 0, y >= 0, w > 0, h > 0, x + w <= width, y + h <= height,
+                  let buffer = MappedBuffer(byteCount: w * h * 4 * MemoryLayout<Float>.size)
+            else { return nil }
+            let target = buffer.bound(to: Float.self)
+            withPixels { source in
+                for row in 0..<h {
+                    target.baseAddress!.advanced(by: row * w * 4)
+                        .update(from: source.baseAddress!.advanced(by: ((y + row) * width + x) * 4),
+                                count: w * 4)
+                }
+            }
+            var part = self
+            part.pixels = buffer
+            part.width = w
+            part.height = h
+            part.ready = nil
+            return part
+        }
+
+        /// The same buffer without the wait, for the one caller that reads it in step with the
+        /// rasterise and waits per strip for the rows it is about to touch.
+        func withPixelsWhileFilling<R>(
+            _ body: (UnsafeBufferPointer<Float>) -> R
+        ) -> R {
+            body(UnsafeBufferPointer(pixels.bound(to: Float.self)))
+        }
+    }
+
+    /// Whole-frame tone and flare readings retained across settled viewport requests.
+    struct DetailMeasurements: @unchecked Sendable {
+        fileprivate enum Storage {
+            case builtIn(FilmFrameContext)
+            case backend(any FilmRenderBackend, any FilmRenderDetailContext)
+            /// A scanned negative's print, which measures nothing over the whole frame beyond the
+            /// reading its scene already carries (`Scene.scanMeasure`).
+            case scanPrint
+        }
+        fileprivate let storage: Storage
+
+        /// Measurements are owned by the backend instance that created them. A newly installed
+        /// backend must measure again instead of interpreting another renderer's cached context.
+        func context(for backend: any FilmRenderBackend) -> (any FilmRenderDetailContext)? {
+            guard case let .backend(owner, context) = storage, owner === backend else { return nil }
+            return context
+        }
+    }
+
+    /// Synchronizes top-to-bottom Core Image rasterization with striped film development.
+    /// Readers wait only for the rows in their next strip; each row is complete before access.
+    final class RowWatermark: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var ready = 0
+        private var finished = false
+
+        /// Rows laid down so far.
+        var rows: Int { condition.lock(); defer { condition.unlock() }; return ready }
+
+        func publish(through row: Int) {
+            condition.lock()
+            ready = max(ready, row)
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        /// Marks the rasterise done, so a waiter for rows that will never arrive gives up rather
+        /// than hangs. Only reached when a band failed, which `context.render` does not report —
+        /// it is the loop ending that publishes the last row.
+        func finish() {
+            condition.lock()
+            finished = true
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        /// Blocks until `row` rows exist, or the rasterise has stopped producing them.
+        func wait(through row: Int) {
+            condition.lock()
+            while ready < row && !finished { condition.wait() }
+            condition.unlock()
+        }
+    }
+
+    static func detailMeasurements(
+        of scene: Scene, state: EditState,
+        negative: NegativeViewing? = nil
+    ) -> DetailMeasurements? {
+        if printsScan(scene, state: state) { return DetailMeasurements(storage: .scanPrint) }
+        if let backend = backendRegistry.current() {
+            do {
+                return DetailMeasurements(storage: .backend(backend,
+                    try backend.detailMeasurements(of: scene, state: state, negative: negative)))
+            } catch {
+                print("FilmRender backend measurements failed: \(error.localizedDescription) (\(error))")
+                return nil
+            }
+        }
+        guard let stock = state.stock,
+              let engine = HalideMetalFilmRenderer.shared,
+              let device = MTLCreateSystemDefaultDevice() else { return nil }
+        var options = state.options(sensor: scene.sensorFrame)
+        options.frameCoverage = scene.frameCoverage
+        options.sceneHeadroom = scene.inputConversion == .preserveHDR
+            ? scene.contentHeadroom : 1
+        options.paper = state.resolvedPaper
+        if let negative { options.negativeViewing = negative }
+
+        let count = scene.width * scene.height * 4
+        guard let input = device.makeBuffer(
+            length: count * MemoryLayout<Float>.size,
+            options: .storageModeShared) else { return nil }
+        scene.withPixels { source in
+            let destination = UnsafeMutableBufferPointer(
+                start: input.contents().assumingMemoryBound(to: Float.self),
+                count: count)
+            expand(source, rows: 0..<scene.height, width: scene.width,
+                   into: destination,
+                   inputConversion: scene.inputConversion)
+        }
+        return engine.makeLinearFloatFrameContext(
+            input: input, width: scene.width, height: scene.height,
+            stock: stock, options: options).map {
+                DetailMeasurements(storage: .builtIn($0))
+            }
+    }
+
+    /// Develops and publishes only a viewport's valid core. Histograms remain whole-frame
+    /// readings from the base preview; the spatial apron is never counted or published here.
+    static func developDetail(
+        _ scene: Scene, measurements: DetailMeasurements, state: EditState,
+        hdr: Bool = false, dynamicRange: AppSettings.DynamicRange = .sdr,
+        exact: Bool = false, negative: NegativeViewing? = nil,
+        report: Reporter? = nil, shouldContinue: (() -> Bool)? = nil
+    ) -> RegionOutput? {
+        guard let viewport = scene.viewport, shouldContinue?() != false else { return nil }
+        if !printsScan(scene, state: state), let backend = backendRegistry.current() {
+            do {
+                let output = try backend.developRegion(DevelopmentRequest(scene: scene, state: state,
+                    detailMeasurements: measurements, collectHistogram: false, hdr: hdr,
+                    dynamicRange: dynamicRange, exact: exact, stock: nil, negative: negative,
+                    report: report, shouldContinue: shouldContinue))
+                return shouldContinue?() == false ? nil : output
+            } catch {
+                if shouldContinue?() != false {
+                    print("FilmRender backend region failed: \(error.localizedDescription) (\(error))")
+                }
+                return nil
+            }
+        }
+        guard let output = develop(scene, state: state, detailMeasurements: measurements,
+            hdr: hdr, dynamicRange: dynamicRange, exact: exact, negative: negative,
+            report: report, shouldContinue: shouldContinue),
+              let image = output.image.image.cropping(to: viewport.displayCropPixelRect.integral)
+        else { return nil }
+        var rendered = Rendered(image: image)
+        rendered.hdrImage = output.image.hdrImage?.cropping(to: viewport.displayCropPixelRect.integral)
+        return RegionOutput(rendered: rendered, viewport: viewport)
+    }
+
+    /// Decodes, places and rasterises the photograph. Automatic interpretation follows source
+    /// metadata; a document override chooses another conversion without changing app settings.
+    ///
+    /// `usesSourceFrame` is whether an unpicked gauge may follow the frame this file says its
+    /// camera exposed. False on the camera's own path: the viewfinder has already shown this scene
+    /// on the film's gauge, and a still that developed on a different one would not be the
+    /// photograph the photographer was looking at when they pressed the button.
+    static func scene(
+        source: PhotoSource,
+        state: EditState,
+        longEdge: Int?,
+        viewport requestedViewport: PreviewViewport? = nil,
+        upright: Bool = true,
+        usesSourceFrame: Bool = true,
+        streaming: Bool = false,
+        storage: MappedBuffer.StoragePreference? = nil,
+        report: Reporter? = nil
+    ) -> Scene? {
+        func time<T>(_ stage: Stage, _ detail: String = "", _ body: () -> T) -> T {
+            report?(.began(stage, detail: detail))
+            let start = Date()
+            let value = body()
+            let note = memoryNote()
+            if !note.isEmpty {
+                report?(.advanced(stage, fraction: 1,
+                                  detail: detail.isEmpty ? note : "\(detail) · \(note)"))
+            }
+            report?(.finished(stage, duration: Date().timeIntervalSince(start)))
+            return value
+        }
+
+        let decodeLongEdge = state.crop == nil && state.cornerCrop == nil && requestedViewport == nil
+            ? longEdge : nil
+        let fixedCaptureIlluminant = source.isRaw
+            ? state.captureIlluminantKelvin.map(Float.init) : nil
+        // Preserve as-shot neutralization for imports. A camera capture reproduces its declared
+        // scene-white lock. Temperature and tint edits belong solely to spectral exposure.
+
+        // Settled before the decode rather than after it, because whether this app has a measurement
+        // of the lens decides whether the decoder should apply its own.
+        let lens = state.lensPlan(for: source.lensShot, dng: source.originalDNGData)
+        // Read once: the probe opens the file, and the answer is wanted three times below.
+        let declaredHeadroom = source.isRaw ? nil : source.declaredHeadroom
+        // A scanned negative's scan stands in for the decode: cleaned and evened as its edit asks,
+        // then framed like any photograph.
+        let document = source.scanDocument
+        guard var decoded = time(.decode, source.detail, { () -> CIImage? in
+            if let document {
+                guard let scan = document.source(state) else { return nil }
+                return decodeLongEdge.map { downsample(scan, longEdge: $0) } ?? scan
+            }
+            return source.decoded(longEdge: decodeLongEdge, neutralKelvin: fixedCaptureIlluminant,
+                                  upright: upright,
+                                  decodeMode: .expandedHDR,
+                                  correctingLens: lens.supersedesDecoder || !state.rawCorrections
+                                      ? false : nil)
+        }) else { return nil }
+        // What the scan's framing reads as, measured on the whole framing so a viewport, a strip
+        // tile and the export all print alike; and in Normal, the plain positive laid down.
+        let scanMeasure: NegativeDocument.Measure?
+        if let document {
+            do {
+                scanMeasure = try document.measure(state) { geometry($0, state: state) }
+            } catch {
+                print("FilmRender scan reading failed: \(error.localizedDescription)")
+                return nil
+            }
+        } else {
+            scanMeasure = nil
+        }
+        let plainScan = state.hasFilm ? nil
+            : scanMeasure.map { NegativeDocument.plain($0, state: state) }
+
+        // Adaptive-HDR stills are processed alternate renditions, not calibrated camera
+        // radiometry. Keep the expanded, linear pixels and their above-white ratios, but remove
+        // the rendition's global exposure lift using the companion SDR rendering as one scalar
+        // reference. No tone-mapped reference pixel enters the scene buffer.
+        if ProcessedHDRExposure.isEligible(
+               isRaw: source.isRaw, declaredHeadroom: declaredHeadroom) {
+            let gain = processedHDRExposureGain(
+                source: source, upright: upright)
+            decoded = ProcessedHDRExposure.applying(gain, to: decoded)
+        }
+        // An HLG or PQ file decodes as display light — reference white at 1.0, HLG's system gamma
+        // applied — and the film is exposed to the scene. Taken after the processed-HDR exposure,
+        // which compares two renditions of the same display light.
+        let hdrTransfer = source.isRaw ? nil
+            : GainMapHeadroom.transfer(profileName: source.descriptor.sourceColorProfile)
+        if hdrTransfer != nil {
+            decoded = GainMapHeadroom.sceneLight(decoded)
+        }
+
+        var contentHeadroom: Float = 1
+        if !source.isRaw, document == nil {
+            if #available(iOS 18.0, macOS 15.0, *) {
+                contentHeadroom = max(1, decoded.contentHeadroom)
+            }
+            // Some ImageIO builds expand a gain map but still report neutral headroom on the
+            // resulting CIImage. The file metadata remains authoritative for automatic handling,
+            // and it states the ceiling as well as the fact of it.
+            if contentHeadroom <= 1, let declared = declaredHeadroom {
+                contentHeadroom = declared
+            }
+            // Core Image states an HDR transfer's range in display light; the film meters the
+            // scene's.
+            if let hdrTransfer { contentHeadroom = hdrTransfer.sceneHeadroom }
+        }
+
+        // The lens is undone first, on the frame as the camera drew it. Every step after this one
+        // moves the optical centre or throws part of the frame away, and a radial correction applied
+        // to a rotated crop would be centred on the wrong place.
+        var frameCoverage: Float = 1
+        var viewport: PreviewViewport?
+        let placed = time(.geometry, longEdge.map { "long edge \($0) px" } ?? "native") {
+            () -> CIImage? in
+            let corrected = LensCorrectionFilter.apply(decoded, stack: lens.stack)
+            let framed = geometry(corrected, state: state)
+            // How much of the frame's short edge the geometry kept. Cropping and
+            // straightening throw film away; the engine scales every millimetre-sized
+            // structure by the enlargement that implies, so the fraction is measured
+            // here where both extents exist and rides the scene to the develop. The camera's
+            // own zoom is framing, not enlargement, so the film frame is that much smaller.
+            let full = min(corrected.extent.width, corrected.extent.height)
+                / CGFloat(max(1, state.framingZoom))
+            if full > 0 {
+                frameCoverage = Float(
+                    min(1, min(framed.extent.width, framed.extent.height) / full))
+            }
+            guard let requestedViewport else {
+                return resample(framed, longEdge: longEdge)
+            }
+
+            var prepared = requestedViewport
+            let coverage = requestedViewport.frameCoverage(
+                composedWith: frameCoverage)
+            if let stock = state.stock {
+                var options = state.options(
+                    sensor: usesSourceFrame ? source.sensorFrame : nil)
+                options.frameCoverage = coverage
+                let density = requestedViewport.densityReferencePixelSize
+                let invocation = FilmEngineInvocation(
+                    stock: stock, options: options,
+                    width: max(1, Int(density.width)),
+                    height: max(1, Int(density.height)))
+                // Layered transport currently solves the complete virtual frame so tails and
+                // reduction-grid phases remain identical while panning and zooming.
+                let support: Int
+                if let backend = backendRegistry.current() {
+                    do { support = try backend.spatialSupport(for: invocation) }
+                    catch {
+                        print("FilmRender backend region sizing failed: \(error)")
+                        return nil
+                    }
+                } else {
+                    support = options.transportConstruction(for: stock) == nil
+                        ? invocation.spatialSupport
+                        : Int(max(requestedViewport.virtualFrameSize.width, requestedViewport.virtualFrameSize.height))
+                }
+                prepared = requestedViewport.addingSpatialSupport(support)
+            }
+            viewport = prepared
+            frameCoverage = coverage
+            let unit = UnitCropCoordinates.verticallyFlipped(
+                prepared.renderUnitRect)
+            let extent = framed.extent
+            let region = CGRect(
+                x: extent.minX + unit.minX * extent.width,
+                y: extent.minY + unit.minY * extent.height,
+                width: unit.width * extent.width,
+                height: unit.height * extent.height).intersection(extent)
+            let cropped = atOrigin(framed.cropped(to: region))
+            return resample(cropped, pixelSize: prepared.renderPixelSize)
+        }
+        guard let placed else { return nil }
+        let extent = placed.extent.integral
+        let width = Int(extent.width), height = Int(extent.height)
+        guard width > 0, height > 0 else { return nil }
+
+        // The illuminant-aware profile delta, applied where the scene-linear working samples are
+        // laid down so every consumer — develop, metering, auto adjust — sees the same light.
+        // Decoded stills are already colorimetric under the file's white balance, so only the
+        // delta against the profile's daylight anchor is valid; when the camera is unknown, the
+        // temperature unstated, or the interpolated profile is exactly its daylight anchor,
+        // nothing runs and the buffer stays bit-identical. It is pointwise, so it goes on band by
+        // band with the rasterise rather than as a second walk over the finished frame.
+        let decodeKelvin = source.isRaw
+            ? fixedCaptureIlluminant
+                ?? source.descriptor.asShotKelvin
+            : nil
+        // The profile delta belongs to the decode: it interpolates the camera's own matrices at
+        // the light the file was neutralized against. The film's light is a separate statement,
+        // and only it decides which spectral exposure table the emulsion integrates.
+        let profileDelta = source.isRaw
+            ? CameraProfileCorrection.resolve(
+                camera: source.camera,
+                sceneKelvin: decodeKelvin)
+            : nil
+        // Capture metadata remains a decode fact. Film exposure uses the edit's independent
+        // Source Illuminant; changing it does not invalidate or re-demosaic these pixels.
+        let sceneKelvin = source.isRaw ? decodeKelvin : nil
+        let rowBytes = width * MemoryLayout<Float>.size * 4
+        let sceneBytes = rowBytes * height
+        let sceneStorage = storage ?? backendRegistry.current()?.sceneStorage(byteCount: sceneBytes) ?? .automatic
+        guard let buffer = MappedBuffer(byteCount: sceneBytes, storage: sceneStorage) else {
+            return nil
+        }
+        /// One band of scene, finished: rendered into scratch, colour-corrected there, and
+        /// written to the buffer through its file — see `MappedBuffer.write` for why not
+        /// through the mapping — in that order, exactly as the whole-frame version did it.
+        func rasterizeBand(_ band: UnsafeMutableRawPointer, byteOffset: Int, byteCount: Int) {
+            if let plainScan {
+                let samples = UnsafeMutableBufferPointer(
+                    start: band.assumingMemoryBound(to: Float.self),
+                    count: byteCount / MemoryLayout<Float>.size)
+                do {
+                    try NegativeScanPreparation.prepare(samples, width: width,
+                                                        height: byteCount / rowBytes,
+                                                        light: nil, plain: plainScan)
+                } catch {
+                    print("FilmRender plain negative failed: \(error.localizedDescription)")
+                }
+            }
+            if let profileDelta {
+                let base = band.assumingMemoryBound(to: Float.self)
+                CameraProfileCorrection.apply(
+                    profileDelta.matrix,
+                    toRGBA: UnsafeMutableBufferPointer(
+                        start: base, count: byteCount / MemoryLayout<Float>.size))
+            }
+            buffer.write(from: band, byteOffset: byteOffset, byteCount: byteCount)
+        }
+        if let profileDelta { CameraProfileCorrection.trace(profileDelta) }
+
+        let pixels = buffer
+        var watermark: RowWatermark?
+        if streaming {
+            let ready = RowWatermark()
+            watermark = ready
+            report?(.began(
+                .rasterize,
+                detail: "\(width) × \(height) px, float, streaming"))
+            let rasterizeStart = Date()
+            rasterizeQueue.async {
+                ImageResampling.rasterizeLinearFloat(
+                    placed, into: pixels.baseAddress,
+                    width: width, height: height,
+                    context: context, colorSpace: linearSpace,
+                    sink: { band, byteOffset, byteCount in
+                        rasterizeBand(band, byteOffset: byteOffset, byteCount: byteCount)
+                        ready.publish(through: (byteOffset + byteCount) / rowBytes)
+                    })
+                ready.publish(through: height)
+                ready.finish()
+                report?(.finished(
+                    .rasterize,
+                    duration: Date().timeIntervalSince(rasterizeStart)))
+            }
+        } else {
+            time(.rasterize, "\(width) × \(height) px, float") {
+                ImageResampling.rasterizeLinearFloat(
+                    placed, into: pixels.baseAddress,
+                    width: width, height: height,
+                    context: context, colorSpace: linearSpace,
+                    sink: { band, byteOffset, byteCount in
+                        rasterizeBand(band, byteOffset: byteOffset, byteCount: byteCount)
+                    })
+            }
+        }
+        let sourceExtent = decoded.extent
+        let maskViewport = viewport
+        var maskGeometry = state
+        maskGeometry.selective = nil
+        return Scene(pixels: pixels, width: width, height: height,
+                     key: SceneKey(state: state, longEdge: longEdge,
+                                   viewport: viewport),
+                     sceneKelvin: sceneKelvin,
+                     sceneChromaticity: fixedCaptureIlluminant == nil ? source.descriptor.asShotChromaticity : nil,
+                     contentHeadroom: contentHeadroom,
+                     frameCoverage: frameCoverage,
+                     viewport: viewport,
+                     sensorFrame: usesSourceFrame ? source.sensorFrame : nil,
+                     takingAperture: source.takingAperture,
+                     ready: watermark,
+                     placeSelectionMask: { mask in
+                         let original = atOrigin(mask).transformed(by: CGAffineTransform(
+                             scaleX: sourceExtent.width / mask.extent.width,
+                             y: sourceExtent.height / mask.extent.height))
+                             .transformed(by: CGAffineTransform(
+                                 translationX: sourceExtent.minX, y: sourceExtent.minY))
+                         let corrected = LensCorrectionFilter.apply(
+                             original, stack: lens.stack, geometryOnly: true)
+                         var framed = geometry(corrected, state: maskGeometry)
+                         if let viewport = maskViewport {
+                             let unit = UnitCropCoordinates.verticallyFlipped(viewport.renderUnitRect)
+                             let extent = framed.extent
+                             let region = CGRect(
+                                 x: extent.minX + unit.minX * extent.width,
+                                 y: extent.minY + unit.minY * extent.height,
+                                 width: unit.width * extent.width,
+                                 height: unit.height * extent.height).intersection(extent)
+                             framed = atOrigin(framed.cropped(to: region))
+                         }
+                         return resample(framed, pixelSize: CGSize(width: width, height: height))
+                     },
+                     scanMeasure: scanMeasure)
+    }
+
+    /// Measure the original renditions so preview size and crop cannot change exposure placement.
+    private static func processedHDRExposureGain(
+        source: PhotoSource, upright: Bool
+    ) -> Float {
+        guard let reference = source.decoded(
+                upright: upright,
+                decodeMode: .coreImageToneMappedSDR),
+              let hdr = source.decoded(
+                upright: upright,
+                decodeMode: .expandedHDR)
+        else { return 1 }
+        return ProcessedHDRExposure.referenceGain(
+            expandedHDR: hdr, sdrReference: reference, context: context)
+    }
+
+    /// `FOTUFILM_EXPORT_SERIAL=1` puts the export back on the path it took before its stages were
+    /// allowed to run beside each other: the rasterise finishes before the develop starts, and
+    /// each strip is written out before the next is developed. It is the seam the proof is taken
+    /// across — one build, two schedules, a digest of the print from each — because a claim that
+    /// scheduling left every pixel alone is worth more when the two runs being compared cannot
+    /// differ in anything else.
+    static let serialExport =
+        ProcessInfo.processInfo.environment["FOTUFILM_EXPORT_SERIAL"] == "1"
+
+    /// The scene's half of that seam on its own, so the two overlaps can be told apart. Letting
+    /// the rasterise run beside the develop and letting a strip's print encode run beside the
+    /// next strip's kernel are separate bargains with separate answers: the first trades one
+    /// piece of the GPU's work against another, the second trades the host's against the
+    /// device's, and only a measurement that can switch them independently says which paid.
+    static let serialScene = serialExport
+        || ProcessInfo.processInfo.environment["FOTUFILM_SERIAL_SCENE"] == "1"
+
+    private static let rasterizeQueue = DispatchQueue(
+        label: "fotufilm.scene.rasterize", qos: .userInitiated)
+
+    /// Halves a scene by averaging 2x2 blocks, for the draft render that runs
+    /// while a control is being dragged.
+    static func halved(_ scene: Scene) -> Scene {
+        let width = max(1, scene.width / 2), height = max(1, scene.height / 2)
+        let rowBytes = width * MemoryLayout<Float>.size * 4
+        guard let pixels = MappedBuffer(byteCount: rowBytes * height) else {
+            return scene
+        }
+        let destination = pixels.bound(to: Float.self)
+        scene.withPixels { source in
+            for y in 0..<height {
+                let top = (2 * y) * scene.width * 4
+                let bottom = min(2 * y + 1, scene.height - 1) * scene.width * 4
+                for x in 0..<width {
+                    let left = 2 * x * 4
+                    let right = min(2 * x + 1, scene.width - 1) * 4
+                    for channel in 0..<4 {
+                        let sum = Float(source[top + left + channel])
+                                + Float(source[top + right + channel])
+                                + Float(source[bottom + left + channel])
+                                + Float(source[bottom + right + channel])
+                        destination[(y * width + x) * 4 + channel] = sum / 4
+                    }
+                }
+            }
+        }
+        var key = scene.key
+        key.longEdge = max(width, height)
+        pixels.flush(byteOffset: 0, byteCount: rowBytes * height)
+        return Scene(pixels: pixels, width: width, height: height, key: key,
+                     sceneKelvin: scene.sceneKelvin,
+                     sceneChromaticity: scene.sceneChromaticity,
+                     contentHeadroom: scene.contentHeadroom,
+                     inputConversion: scene.inputConversion,
+                     frameCoverage: scene.frameCoverage,
+                     viewport: scene.viewport,
+                     sensorFrame: scene.sensorFrame,
+                     takingAperture: scene.takingAperture,
+                     scanMeasure: scene.scanMeasure)
+    }
+
+    /// Develops `source` under `state`, resampled so its long edge is
+    /// `longEdge` (nil keeps the source's own resolution).
+    static func render(
+        source: PhotoSource,
+        state: EditState,
+        longEdge: Int?,
+        hdr: Bool = false,
+        dynamicRange: AppSettings.DynamicRange = AppSettings.storedStillDynamicRange,
+        exact: Bool = false,
+        upright: Bool = true,
+        usesSourceFrame: Bool = true,
+        negative: NegativeViewing? = nil,
+        frame: PrintFrameConfiguration? = nil,
+        report: Reporter? = nil
+    ) -> Rendered? {
+        // The develop reads the frame top-down in strips and the rasterise lays it down top-down
+        // in bands, so the two need not take turns: the scene comes back as soon as its geometry
+        // is settled and the film model waits per strip for the rows it is about to read.
+        guard var scene = scene(source: source, state: state,
+                                longEdge: longEdge, upright: upright,
+                                usesSourceFrame: usesSourceFrame,
+                                streaming: !serialScene,
+                                report: report) else { return nil }
+        // A film border shows the part of the photograph its aperture fills, and the rest of
+        // the render is of that part.
+        if let frame, let crop = PrintFramePlacement.photoCrop(width: scene.width, height: scene.height,
+                                                               configuration: frame) {
+            guard let part = scene.cropped(to: crop) else { return nil }
+            scene = part
+        }
+        #if os(iOS)
+        // The phone has a few hundred megabytes for the whole export; the tile staging the
+        // develop keeps for the next frame is worth more to the encode that follows it.
+        defer { HalideMetalFilmRenderer.releaseIdleBuffers() }
+        #endif
+        // The Emulsion Border develops a larger piece of film, the photograph included, as a Film
+        // Border develops its whole strip. A scanned negative has its own film's edge in the
+        // scan, and no larger piece to develop: its Film Border is drawn around it.
+        let scanned = source.scanDocument != nil
+        let frame = frame?.frame == .emulsion && scanned ? nil : frame
+        let developsPiece = frame?.frame == .emulsion
+            || (!scanned && frame.map { PrintFramePlacement.filmStrip(width: scene.width, height: scene.height,
+                                                                      configuration: $0) != nil } == true)
+        let print = developsPiece ? nil : develop(
+            scene, state: state, hdr: hdr, dynamicRange: dynamicRange,
+            exact: exact, negative: negative, report: report
+        )?.image
+        var rendered: Rendered
+        if let frame {
+            guard let framed = framed(print, in: frame, scene: scanned ? nil : scene, state: state, hdr: hdr,
+                                      dynamicRange: dynamicRange, exact: exact,
+                                      negative: negative) else { return nil }
+            rendered = framed.rendered
+            rendered.photoRect = framed.layout.imageRect
+        } else {
+            guard let print else { return nil }
+            rendered = print
+        }
+        rendered.metadata = source.captureMetadata
+        rendered.orientation = upright ? .up : source.orientation
+        return rendered
+    }
+
+    /// Runs the film model over an already-decoded scene.
+    static func develop(
+        _ scene: Scene,
+        state: EditState,
+        detailMeasurements: DetailMeasurements? = nil,
+        collectHistogram: Bool = false,
+        hdr: Bool = false,
+        dynamicRange: AppSettings.DynamicRange = AppSettings.storedStillDynamicRange,
+        exact: Bool = false,
+        stock stockOverride: FilmStock? = nil,
+        negative: NegativeViewing? = nil,
+        report: Reporter? = nil,
+        shouldContinue: (() -> Bool)? = nil
+    ) -> DevelopmentOutput? {
+        if let selection = state.selective, selection.hasSelection {
+            return developSelection(scene, state: state, selection: selection,
+                detailMeasurements: detailMeasurements, collectHistogram: collectHistogram,
+                hdr: hdr, dynamicRange: dynamicRange, exact: exact, stock: stockOverride,
+                negative: negative, report: report, shouldContinue: shouldContinue)
+        }
+        // The installed backend's graph has no scan reading; only the engine's own kernels print a
+        // scanned negative.
+        if !printsScan(scene, state: state), let backend = backendRegistry.current() {
+            guard shouldContinue?() != false else { return nil }
+            let request = DevelopmentRequest(scene: scene, state: state,
+                detailMeasurements: detailMeasurements, collectHistogram: collectHistogram,
+                hdr: hdr, dynamicRange: dynamicRange, exact: exact, stock: stockOverride,
+                negative: negative, report: report, shouldContinue: shouldContinue)
+            do {
+                let output = try backend.develop(request)
+                return shouldContinue?() == false ? nil : output
+            } catch {
+                if shouldContinue?() != false {
+                    print("FilmRender backend failed: \(error.localizedDescription) (\(error))")
+                }
+                return nil
+            }
+        }
+        func time<T>(_ stage: Stage, _ detail: String = "", _ body: () -> T) -> T {
+            report?(.began(stage, detail: detail))
+            let start = Date()
+            let value = body()
+            let note = memoryNote()
+            if !note.isEmpty {
+                report?(.advanced(stage, fraction: 1,
+                                  detail: detail.isEmpty ? note : "\(detail) · \(note)"))
+            }
+            report?(.finished(stage, duration: Date().timeIntervalSince(start)))
+            return value
+        }
+
+        let width = scene.width, height = scene.height
+        guard width > 0, height > 0, shouldContinue?() != false else { return nil }
+        // Taken before `withPixels` shadows the name. Nil for a scene that is already whole,
+        // which is every scene the editor holds between renders.
+        let sceneReady = scene.ready
+        let entryTime = Date()
+        var setupSeconds = 0.0
+        // Which of the two develops this is. A photograph on no film goes without the emulsion and
+        // so without the engine; one on a film the pack no longer carries, or with no engine to run
+        // it, has nothing to develop with at all.
+        let stillTimings = ProcessInfo.processInfo
+            .environment["FOTUFILM_STILL_TIMINGS"] != nil
+        let film: (stock: FilmStock, engine: HalideMetalFilmRenderer)?
+        if let stock = stockOverride ?? state.stock {
+            guard let engine = HalideMetalFilmRenderer.shared else {
+                if stillTimings { print("  develop: no Metal engine") }
+                return nil
+            }
+            film = (stock, engine)
+        } else {
+            guard StockPreset.isNoFilm(state.stockID) else {
+                if stillTimings {
+                    print("  develop: film \(state.stockID) is not installed")
+                }
+                return nil
+            }
+            film = nil
+        }
+        // A film-free develop is a kernel too — `FilmEngineFeature.noFilm`, which is
+        // `PlainDevelop` expressed in the shared Halide source. It names `FilmStock.noFilm`
+        // because the configuration is built from a stock and reads nothing that stock filled.
+        // Nil where there is no Metal at all, and then the Swift path below still runs it.
+        let plainEngine = film == nil ? HalideMetalFilmRenderer.shared : nil
+        let stock = film?.stock
+        // Resolve automatic gauge from the scene's captured sensor frame.
+        var options = state.options(sensor: scene.sensorFrame)
+        // The film the geometry kept, measured when the scene was placed: a cropped
+        // picture is an enlargement, and the engine scales grain and the other
+        // millimetre-sized structures to match.
+        options.frameCoverage = scene.frameCoverage
+        options.unexposedEdge = scene.unexposedEdge
+        // state.options selects stock-native or explicit source light. Capture white remains
+        // attached to the decoded scene for provenance, not as an implicit rendering override.
+        // The recorded range above diffuse white, so an HDR source's highlights are metered
+        // into the film's latitude instead of printing to paper white. Only when the scene
+        // kept that light: an engine tone-mapped scene is already SDR.
+        options.sceneHeadroom = scene.inputConversion == .preserveHDR
+            ? scene.contentHeadroom : 1
+        if stock != nil { options.paper = state.resolvedPaper }
+        // The requested delivery range is independent of the source. Negative film keeps the
+        // source's full exposure range through development, but only direct-positive film and the
+        // no-film path may be delivered above display white.
+        let supportsHDR = stock.map { options.supportsHDRDelivery(for: $0) } ?? true
+        let wantsHDR = hdr && dynamicRange == .hdr && supportsHDR
+        let inputConversion = scene.inputConversion
+        if let negative {
+            options.negativeViewing = negative
+        }
+        // A scanned negative read as its film: the scan's densities printed by the edit's own
+        // print, its light controls moved onto the print (`NegativeScanPrint.printing`).
+        var scanReading: NegativeScanPrint.Reading?
+        if printsScan(scene, state: state), let stock, let measure = scene.scanMeasure {
+            do {
+                let reading = try NegativeDocument.reading(measure, state: state, stock: stock)
+                options = reading.printing(options, stock: stock)
+                scanReading = reading
+            } catch {
+                print("FilmRender scan print failed: \(error.localizedDescription)")
+                return nil
+            }
+        }
+        let active = stock.map {
+            activeStages(stock: $0, options: options, width: width, height: height)
+        } ?? "no film"
+        var bins = [[Float]](repeating: [Float](repeating: 0, count: 64), count: 3)
+        var hdrBins = [[Float]](repeating: [Float](repeating: 0, count: 64),
+                                count: 3)
+
+        if stillTimings {
+            setupSeconds = Date().timeIntervalSince(entryTime)
+            print(String(format: "  %-10@ %8.1f ms",
+                         "options" as NSString, setupSeconds * 1000))
+        }
+        let allocateStart = Date()
+        guard let output = MappedBuffer(byteCount: width * height * 8) else {
+            if stillTimings {
+                print("  develop: no \((width * height * 8) >> 20) MB output buffer")
+            }
+            return nil
+        }
+        if stillTimings {
+            print(String(format: "  %-10@ %8.1f ms", "allocate" as NSString,
+                         Date().timeIntervalSince(allocateStart) * 1000))
+        }
+
+        let hdrOutput = wantsHDR ? MappedBuffer(byteCount: width * height * 8) : nil
+        if wantsHDR, hdrOutput == nil { return nil }
+
+        var glareStart: Date?
+        var developStart: Date?
+        /// How much of `develop` is the host widening the scene and encoding the print, rather than
+        /// the engine. Both are full passes over the frame and neither shows up as its own stage.
+        final class HandoverClock {
+            var read = 0.0, write = 0.0
+            /// Time a strip spent waiting for the rasterise to reach its rows — what is left of
+            /// the scene's own cost once it runs beside the develop instead of before it.
+            var wait = 0.0
+            /// `write` minus the flush: the encode is arithmetic per pixel and the flush is the
+            /// kernel starting writeback on a mapped page, and only one of them is worth trying
+            /// to overlap with the engine.
+            var encode = 0.0
+        }
+        let handoverClock = HandoverClock()
+        let printed = output.bound(to: UInt16.self)
+        let hdrPrinted = hdrOutput?.bound(to: UInt16.self)
+        // Still delivery has one portable conversion contract. ImageIO only packs and tags the
+        // resulting normalized values; it does not choose another transfer implementation.
+        // A Cineon Log scan's code values are a signal already, and leave as they are.
+        let sdrConversion: AnyFilmOutputConverter = film == nil
+            ? AnyFilmOutputConverter(FilmOutputConversion.displayP3)
+            : stock.map { AnyFilmOutputConverter.still(options, stock: $0) }
+                ?? AnyFilmOutputConverter(FilmDisplayP3SDRConversion(
+                    shoulderKnee: FilmSDRDelivery.boundedShoulderKnee))
+        // The same delivery, named so the engine can take it in the producing kernel instead of
+        // handing back display-linear light for the host to walk. Three things have to hold: the
+        // engine's streaming path is the one developing (the film-free and viewport paths do
+        // their own banding), the frame is not also being delivered as HDR — the HLG conversion
+        // below reads the same rows and needs them still linear — and a variant that carries the
+        // encode exists for this frame. `carriesOutputTransform` answers the last one before the
+        // first strip, which is the only time it can be asked: a streaming render has already
+        // written rows by the time it could return a refusal.
+        let wantsKernelDelivery = hdrPrinted == nil && scanReading == nil
+            && !(scene.viewport != nil && detailMeasurements != nil)
+        // The film develop's transform, and the film-free one's. They differ only in the
+        // shoulder, which is the difference between the two converters above.
+        var outputTransform: FilmOutputTransform? = nil
+        var plainTransform: FilmOutputTransform? = nil
+        if wantsKernelDelivery, let film,
+           film.engine.carriesOutputTransform(
+               stock: film.stock, options: options, width: width,
+               height: height, exactMath: exact) {
+            outputTransform = stock.map { FilmOutputTransform.still(options, stock: $0) }
+                ?? .displayP3(shoulderKnee: FilmSDRDelivery.boundedShoulderKnee)
+        }
+        if wantsKernelDelivery, let plainEngine,
+           plainEngine.carriesOutputTransform(
+               stock: .noFilm, options: options, width: width,
+               height: height, exactMath: exact, noFilm: true) {
+            plainTransform = .displayP3()
+        }
+        let deliveredByKernel = outputTransform != nil || plainTransform != nil
+        // Writes one block of completed output: `from` is a dense `columns.count` x
+        // `rows.count` block. A block the frame's width is encoded in one pass; a narrower one
+        // — a tile of a frame too large to band — a row at a time into its span of the print.
+        func writeTile(_ rows: Range<Int>, _ columns: Range<Int>,
+                       _ from: UnsafeBufferPointer<Float>) {
+            let full = columns == 0..<width
+            func encode(into destination: UnsafeMutableBufferPointer<UInt16>,
+                        _ body: (UnsafeBufferPointer<Float>, Range<Int>, Int,
+                                 UnsafeMutableBufferPointer<UInt16>) -> Void) {
+                if full { return body(from, rows, width, destination) }
+                let span = columns.count * 4
+                // Rows of a block are independent, so they go across the cores in runs, as
+                // the frame-wide encoders spread theirs.
+                let run = 64
+                DispatchQueue.concurrentPerform(iterations: (rows.count + run - 1) / run) {
+                    let first = rows.lowerBound + $0 * run
+                    for row in first..<min(rows.upperBound, first + run) {
+                        let source = (row - rows.lowerBound) * span
+                        let target = (row * width + columns.lowerBound) * 4
+                        body(UnsafeBufferPointer(rebasing: from[source..<(source + span)]),
+                             0..<1, columns.count,
+                             UnsafeMutableBufferPointer(
+                                rebasing: destination[target..<(target + span)]))
+                    }
+                }
+            }
+            // Writeback starts once a band of rows is complete — with the block that closes
+            // it — since a flush covers whole rows: block by block it would start the same
+            // rows over as many times as there are blocks across.
+            let closesBand = columns.upperBound == width
+            let encodeStart = stillTimings ? Date() : Date.distantPast
+            if deliveredByKernel {
+                encode(into: printed) { from, rows, width, into in
+                    PrintEncoding.packRows(from, rows: rows, width: width, into: into)
+                }
+            } else {
+                encode(into: printed) { from, rows, width, into in
+                    PrintEncoding.encodeRows(from, rows: rows, width: width, into: into,
+                                             converter: sdrConversion)
+                }
+            }
+            if stillTimings {
+                handoverClock.encode += Date().timeIntervalSince(encodeStart)
+            }
+            if let hdrPrinted, let hdrOutput {
+                encode(into: hdrPrinted) { from, rows, width, into in
+                    PrintEncoding.encodeRows(from, rows: rows, width: width, into: into,
+                                             converter: FilmOutputConversion.rec2020HLG)
+                }
+                if closesBand {
+                    hdrOutput.flush(byteOffset: rows.lowerBound * width * 8,
+                                    byteCount: rows.count * width * 8)
+                }
+            }
+            if closesBand {
+                output.flush(byteOffset: rows.lowerBound * width * 8,
+                             byteCount: rows.count * width * 8)
+            }
+            // The finished print, keyed by the pixel the block starts at, so the proof does
+            // not depend on the order the engine happens to hand its blocks back in.
+            if ExportProof.isEnabled, let base = printed.baseAddress {
+                ExportProof.addRows(
+                    key: rows.lowerBound * width + columns.lowerBound,
+                    UnsafeRawPointer(base + (rows.lowerBound * width + columns.lowerBound) * 4),
+                    rowBytes: width * 8, usedBytesPerRow: columns.count * 8,
+                    rows: rows.count)
+            }
+            guard collectHistogram else { return }
+            for row in rows {
+                let base = (row * width + columns.lowerBound) * 4
+                for index in stride(from: 0, to: columns.count * 4, by: 4) {
+                    for channel in 0..<3 {
+                        bins[channel][Int(printed[base + index + channel]) >> 10] += 1
+                    }
+                }
+                guard let hdrPrinted else { continue }
+                for index in stride(from: 0, to: columns.count * 4, by: 4) {
+                    for channel in 0..<3 {
+                        hdrBins[channel][Int(hdrPrinted[base + index + channel]) >> 10] += 1
+                    }
+                }
+            }
+        }
+        func writeRows(_ rows: Range<Int>, _ from: UnsafeBufferPointer<Float>) {
+            writeTile(rows, 0..<width, from)
+        }
+
+        /// One band's worth of progress, said the way the engine says it.
+        func advance(band index: Int, of count: Int) {
+            if let started = glareStart {
+                glareStart = nil
+                report?(.finished(.glare,
+                                  duration: Date().timeIntervalSince(started)))
+            }
+            if developStart == nil {
+                developStart = Date()
+                report?(.began(.develop, detail: active))
+            }
+            let detail = count > 1 ? "strip \(index + 1) of \(count)" : active
+            report?(.advanced(.develop, fraction: Double(index) / Double(count),
+                              detail: detail))
+        }
+
+        // Source interpretation decides what reaches the film. Output range remains an independent
+        // decision in `writeRows`.
+        let streamStart = Date()
+        let ok = scene.withPixelsWhileFilling { scenePixels -> Bool in
+            guard let film else {
+                // No strips on this path: it bands the frame itself, from the top, but it also
+                // measures the whole frame first, so there is nothing to be gained by letting it
+                // start early.
+                sceneReady?.wait(through: height)
+                if let plainEngine {
+                    advance(band: 0, of: 1)
+                    var transform = plainTransform
+                    let developed = plainEngine.developStreaming(
+                        width: width, height: height, stock: .noFilm,
+                        options: options, outputTransform: &transform,
+                        exactMath: exact, noFilm: true,
+                        overlapsWriteback: !serialExport,
+                        shouldContinue: shouldContinue,
+                        readRows: { rows, into in
+                            expand(scenePixels, rows: rows, width: width, into: into,
+                                   inputConversion: inputConversion)
+                        },
+                        writeRows: writeRows)
+                    // What the develop decided, back where the guard after it can read it.
+                    plainTransform = transform
+                    return developed
+                }
+                return developPlain(scenePixels, width: width, height: height,
+                                    options: options,
+                                    inputConversion: inputConversion,
+                                    shouldContinue: shouldContinue,
+                                    progress: advance, writeRows: writeRows)
+            }
+            if let scanReading {
+                advance(band: 0, of: 1)
+                return film.engine.printScan(
+                    width: width, height: height, stock: film.stock, options: options,
+                    calibration: scanReading.calibration, shouldContinue: shouldContinue,
+                    readScan: { rows, into in
+                        sceneReady?.wait(through: rows.upperBound)
+                        expand(scenePixels, rows: rows, width: width, into: into,
+                               inputConversion: inputConversion)
+                    },
+                    writeRows: writeRows)
+            }
+            if let viewport = scene.viewport, let detailMeasurements {
+                sceneReady?.wait(through: height)
+                advance(band: 0, of: 1)
+                return developRegion(
+                    scenePixels, width: width, height: height,
+                    measurements: detailMeasurements,
+                    viewport: viewport, film: film,
+                    options: options,
+                    inputConversion: inputConversion,
+                    exactMath: exact, shouldContinue: shouldContinue, writeTile: writeTile)
+            }
+            return film.engine.developStreaming(
+                width: width, height: height, stock: film.stock, options: options,
+                outputTransform: &outputTransform,
+                exactMath: exact,
+                // This `writeRows` is `PrintEncoding` over a buffer the app owns, so it does not
+                // care which thread calls it — and it is a full pass over the strip in float,
+                // which is exactly the kind of host work worth hiding behind the next strip's
+                // kernel.
+                overlapsWriteback: !serialExport,
+                progress: { phase in
+                    switch phase {
+                    case .measuringGlare:
+                        glareStart = Date()
+                        report?(.began(.glare, detail: "whole-frame mean"))
+                    case .developing(let index, let count):
+                        advance(band: index, of: count)
+                    }
+                },
+                shouldContinue: shouldContinue,
+                readTile: { rows, columns, into in
+                    let t0 = Date()
+                    // Only the rows this tile is about to expand, and only when the rasterise
+                    // is still behind them.
+                    sceneReady?.wait(through: rows.upperBound)
+                    handoverClock.wait += Date().timeIntervalSince(t0)
+                    let t1 = Date()
+                    expand(scenePixels, rows: rows, columns: columns, width: width,
+                           into: into, inputConversion: inputConversion)
+                    handoverClock.read += Date().timeIntervalSince(t1)
+                },
+                writeTile: { rows, columns, from in
+                    let t0 = Date()
+                    writeTile(rows, columns, from)
+                    handoverClock.write += Date().timeIntervalSince(t0)
+                })
+        }
+        if stillTimings {
+            let streamed = Date().timeIntervalSince(streamStart)
+            print(String(format: "  %-10@ %8.1f ms", "stream" as NSString,
+                         streamed * 1000))
+            print(String(format: "  %-10@ %8.1f ms", "scenewait" as NSString,
+                         handoverClock.wait * 1000))
+            print(String(format: "  %-10@ %8.1f ms", "expand" as NSString,
+                         handoverClock.read * 1000))
+            print(String(format: "  %-10@ %8.1f ms (encode %.1f, flush %.1f)",
+                         "printenc" as NSString, handoverClock.write * 1000,
+                         handoverClock.encode * 1000,
+                         (handoverClock.write - handoverClock.encode) * 1000))
+        }
+        if let started = developStart {
+            let note = memoryNote()
+            if !note.isEmpty {
+                report?(.advanced(.develop, fraction: 1, detail: "\(active) · \(note)"))
+            }
+            report?(.finished(.develop, duration: Date().timeIntervalSince(started)))
+        }
+        guard ok, shouldContinue?() != false else { return nil }
+        // `carriesOutputTransform` asked the same question the develop call answers for itself,
+        // so the two agree or the build is inconsistent. They cannot be allowed to disagree
+        // silently: `writeRows` has already packed every row as delivered pixels, and a refusal
+        // here means those rows were display-linear light.
+        guard deliveredByKernel == (outputTransform != nil || plainTransform != nil)
+        else { return nil }
+
+        let image = time(.encode, wantsHDR ? "16-bit sRGB + HLG" : "16-bit sRGB") {
+            PrintEncoding.makeImage(takingOwnershipOf: output, width: width,
+                                    height: height,
+                                    colorSpace: PrintEncoding.colorSpace(
+                                        for: sdrConversion.colorSpace) ?? outputSpace)
+        }
+        guard let image else { return nil }
+        let hdrImage = hdrOutput.flatMap { buffer in
+            PrintEncoding.colorSpace(
+                for: FilmOutputConversion.rec2020HLG.colorSpace
+            ).flatMap {
+                PrintEncoding.makeImage(takingOwnershipOf: buffer, width: width,
+                                        height: height, colorSpace: $0)
+            }
+        }
+        let rendered = Rendered(image: image, hdrImage: hdrImage)
+        guard collectHistogram else { return (rendered, nil, nil) }
+        func normalized(_ bins: [[Float]]) -> [[Float]] {
+            let peak = max(1, bins.flatMap { $0 }.max() ?? 1)
+            return bins.map { channel in channel.map { $0 / peak } }
+        }
+        return (rendered, normalized(bins),
+                hdrImage == nil ? nil : normalized(hdrBins))
+    }
+
+    /// A print inside its frame, and where the photograph stands in it.
+    struct Framed: @unchecked Sendable {
+        let rendered: Rendered
+        let layout: PrintFrameRenderer.Layout
+    }
+
+    /// The print of `scene` inside `frame`. Every other frame is drawn around `print`, the print
+    /// `develop` made of `scene`. The Emulsion Border prints a larger piece of film, and a Film
+    /// Border with a scene its whole strip, developed here from `scene` under the same
+    /// arguments, so they ignore `print` and a caller that has not developed one may pass nil.
+    static func framed(
+        _ print: Rendered?, in frame: PrintFrameConfiguration, scene: Scene?, state: EditState,
+        hdr: Bool = false,
+        dynamicRange: AppSettings.DynamicRange = AppSettings.storedStillDynamicRange,
+        exact: Bool = false, negative: NegativeViewing? = nil,
+        shouldContinue: (() -> Bool)? = nil
+    ) -> Framed? {
+        // A Film Border develops its whole strip where there is a scene to expose it with; a
+        // scanned negative, or integral instant film, keeps the drawn rebate.
+        if frame.frame == .emulsion
+            || (frame.frame.showsFilmStrip && scene != nil
+                && PrintFramePlacement.filmStrip(width: scene!.width, height: scene!.height,
+                                                 configuration: frame) != nil) {
+            guard let scene,
+                  let film = developFilm(beyond: scene, state: state,
+                                         strip: frame.frame == .emulsion ? nil : frame, hdr: hdr,
+                                         dynamicRange: dynamicRange, exact: exact,
+                                         negative: negative, shouldContinue: shouldContinue),
+                  let image = PrintFrameRenderer.render(film.rendered.image, configuration: frame,
+                                                        edge: film.margins)
+            else { return nil }
+            var hdrImage: CGImage?
+            if let developed = film.rendered.hdrImage {
+                guard let framed = PrintFrameRenderer.render(developed, configuration: frame,
+                                                             edge: film.margins)
+                else { return nil }
+                hdrImage = framed
+            }
+            return Framed(
+                rendered: Rendered(image: image, hdrImage: hdrImage,
+                                   metadata: print?.metadata, orientation: print?.orientation ?? .up),
+                layout: PrintFrameRenderer.layout(width: scene.width, height: scene.height,
+                                                  configuration: frame, edge: film.margins))
+        }
+        guard let print, let image = PrintFrameRenderer.render(print.image, configuration: frame)
+        else { return nil }
+        var hdrImage: CGImage?
+        if let developed = print.hdrImage {
+            guard let framed = PrintFrameRenderer.render(developed, configuration: frame)
+            else { return nil }
+            hdrImage = framed
+        }
+        return Framed(
+            rendered: Rendered(image: image, hdrImage: hdrImage, metadata: print.metadata,
+                               orientation: print.orientation),
+            layout: PrintFrameRenderer.layout(width: print.image.width, height: print.image.height,
+                                              configuration: frame))
+    }
+
+    /// `original` in the photograph's place inside a framed print, for press-to-compare: the
+    /// frame stays as it is and only the picture changes.
+    static func comparing(_ original: CGImage, in framed: CGImage,
+                          layout: PrintFrameRenderer.Layout) -> CGImage? {
+        guard let space = framed.colorSpace,
+              let context = CGContext(data: nil, width: framed.width, height: framed.height,
+                                      bitsPerComponent: framed.bitsPerComponent, bytesPerRow: 0,
+                                      space: space, bitmapInfo: framed.bitmapInfo.rawValue)
+        else { return nil }
+        let whole = CGRect(x: 0, y: 0, width: framed.width, height: framed.height)
+        context.draw(framed, in: whole)
+        context.interpolationQuality = .high
+        context.draw(original, in: layout.imageRect)
+        return context.makeImage()
+    }
+
+    /// A piece of film larger than the camera's aperture, developed whole: `scene` is the light
+    /// the lens forms inside the aperture, continued past its edges as the world beyond them, and
+    /// the gate passes it only inside (`UnexposedEdge`). The film reaches as far beyond the
+    /// aperture as the gauge's emulsion does before its perforations or cut edge, and the gate's
+    /// shadow is the one the picture's own aperture casts on that gauge. Given a Film Border,
+    /// the piece is that frame's whole strip instead (`PrintFramePlacement.filmStrip`), seen on
+    /// the light box with no carrier. Nil with no film, on a gauge with no emulsion there, or
+    /// when the develop fails.
+    static func developFilm(
+        beyond scene: Scene, state: EditState, strip: PrintFrameConfiguration? = nil, hdr: Bool = false,
+        dynamicRange: AppSettings.DynamicRange = AppSettings.storedStillDynamicRange,
+        exact: Bool = false, negative: NegativeViewing? = nil,
+        shouldContinue: (() -> Bool)? = nil
+    ) -> (rendered: Rendered, margins: UnexposedEdge.Margins)? {
+        guard let stock = state.stock, scene.viewport == nil, scene.unexposedEdge == nil,
+              scene.width > 0, scene.height > 0 else { return nil }
+        var options = state.options(sensor: scene.sensorFrame)
+        options.frameCoverage = scene.frameCoverage
+        options.sceneHeadroom = scene.inputConversion == .preserveHDR ? scene.contentHeadroom : 1
+        options.paper = state.resolvedPaper
+        if let negative { options.negativeViewing = negative }
+        let motionPicture = FilmFormat.preset(id: StockPreset.nativeFormatID(for: state.stockID))?
+            .isMotionPicture == true
+        guard let invocation = try? FilmEngineInvocation(validating: stock, options: options,
+                                                         width: scene.width, height: scene.height)
+        else { return nil }
+        let margins: UnexposedEdge.Margins
+        if let strip {
+            guard let film = PrintFramePlacement.filmStrip(width: scene.width, height: scene.height,
+                                                           configuration: strip) else { return nil }
+            margins = film
+        } else {
+            guard let geometry = UnexposedEdge.Geometry.preset(options.format.presetID ?? state.formatID,
+                                                               motionPictureStock: motionPicture)
+            else { return nil }
+            margins = geometry.margins(
+                photoWidth: scene.width, photoHeight: scene.height,
+                pixelsPerMM: options.pixelsPerMM(width: scene.width, height: scene.height),
+                carrier: !stock.isReversal)
+        }
+        // The photograph's own Auto Levels reading, metered as its develop meters it.
+        var stops = options.sceneHighlightStops
+        var medians = options.sceneChannelMedians
+        var tone = options.sceneToneStops
+        if stops == nil, invocation.sceneMeteringActive {
+            var measurement = invocation.toneBaseMeasurement()
+            let bandRows = max(1, 262_144 / scene.width)
+            var scratch = [Float](repeating: 0, count: min(bandRows, scene.height) * scene.width * 4)
+            scene.withPixels { pixels in
+                var row = 0
+                while row < scene.height {
+                    let upper = min(scene.height, row + bandRows)
+                    scratch.withUnsafeMutableBufferPointer { buffer in
+                        expand(pixels, rows: row..<upper, width: scene.width, into: buffer,
+                               inputConversion: scene.inputConversion)
+                        measurement.add(linearRGBA: buffer.baseAddress!, rows: row..<upper)
+                    }
+                    row = upper
+                }
+            }
+            stops = invocation.sceneHighlightStops(measurement)
+            medians = invocation.sceneChannelMedians(measurement)
+            tone = invocation.sceneToneStops(measurement)
+        }
+        let width = scene.width + margins.left + margins.right
+        let height = scene.height + margins.top + margins.bottom
+        guard shouldContinue?() != false,
+              let pixels = MappedBuffer(byteCount: width * height * 4 * MemoryLayout<Float>.size)
+        else { return nil }
+        scene.withPixels {
+            UnexposedEdge.extend($0, width: scene.width, height: scene.height, margins: margins,
+                                 into: pixels.bound(to: Float.self))
+        }
+        pixels.flush(byteOffset: 0, byteCount: width * height * 4 * MemoryLayout<Float>.size)
+        var key = scene.key
+        key.longEdge = max(width, height)
+        let film = Scene(
+            pixels: pixels, width: width, height: height, key: key,
+            sceneKelvin: scene.sceneKelvin, sceneChromaticity: scene.sceneChromaticity,
+            contentHeadroom: scene.contentHeadroom, inputConversion: scene.inputConversion,
+            frameCoverage: scene.frameCoverage, viewport: nil, sensorFrame: scene.sensorFrame,
+            takingAperture: scene.takingAperture,
+            unexposedEdge: .init(margins: margins, sceneHighlightStops: stops,
+                                 sceneChannelMedians: medians, sceneToneStops: tone,
+                                 fNumber: scene.takingAperture?.equivalent(on: options.format)))
+        func print(_ state: EditState) -> Rendered? {
+            develop(film, state: state, hdr: hdr, dynamicRange: dynamicRange, exact: exact,
+                    negative: negative, shouldContinue: shouldContinue)?.image
+        }
+        guard let selection = state.selective, selection.hasSelection else {
+            return print(state).map { ($0, margins) }
+        }
+        // A selective edit is drawn on the photograph. Its mask reaches the film beyond as the
+        // picture does, continued from the nearest edge.
+        var base = state
+        base.selective = nil
+        guard let source = selectionSource(scene),
+              let photoMask = selectionMask(scene, state: selection, source: source),
+              let ground = print(base),
+              let over = print(selection.edit.applying(to: base)) else { return nil }
+        let mask = photoMask.clampedToExtent()
+            .transformed(by: CGAffineTransform(translationX: CGFloat(margins.left),
+                                               y: CGFloat(margins.bottom)))
+            .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = compositeSelection(ground: ground.image, over: over.image, mask: mask,
+                                             state: selection) else { return nil }
+        var hdrImage: CGImage?
+        if let groundHDR = ground.hdrImage, let overHDR = over.hdrImage {
+            guard let blended = compositeSelection(ground: groundHDR, over: overHDR, mask: mask,
+                                                   state: selection) else { return nil }
+            hdrImage = blended
+        }
+        return (Rendered(image: image, hdrImage: hdrImage), margins)
+    }
+
+    /// Stable, geometry-correct source shared by the Mac sampler, iOS sampler and saved masks.
+    static func selectionSource(_ scene: Scene) -> CGImage? {
+        var plain = EditState()
+        plain.stockID = StockPreset.noFilmID
+        return develop(scene, state: plain, dynamicRange: .sdr)?.image.image
+    }
+
+    static func selectionMask(_ scene: Scene, state: SelectiveState,
+                              source: CGImage) -> CIImage? {
+        let guide = CIImage(cgImage: source)
+        let subject = state.subjectMask.flatMap(SubjectMask.decoded).map {
+            scene.placeSelectionMask?($0) ?? $0
+        }
+        return SelectiveMask.image(over: guide, extent: guide.extent, state: state,
+            subjects: nil, colorSpace: selectionColorSpace, placedSubject: subject)
+    }
+
+    /// Hit testing uses the same placement as the rendered subject mask, including crop and lens.
+    static func selectedSubject(at point: CGPoint, in scene: Scene,
+                                subjects: SubjectMask.Reading) -> Int? {
+        var best: (instance: Int?, weight: Float) = (nil, 0.5)
+        for instance in subjects.allInstances {
+            guard let raw = subjects.mask(of: IndexSet(integer: instance)) else { continue }
+            let mask = scene.placeSelectionMask?(raw) ?? raw
+            let extent = mask.extent
+            let x = floor(extent.minX + min(max(point.x, 0), 0.999999) * extent.width)
+            let y = floor(extent.minY + min(max(1 - point.y, 0), 0.999999) * extent.height)
+            var pixel = [Float](repeating: 0, count: 4)
+            context.render(mask, toBitmap: &pixel, rowBytes: 16,
+                bounds: CGRect(x: x, y: y, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+            if pixel[0] > best.weight { best = (instance, pixel[0]) }
+        }
+        return best.instance
+    }
+
+    static let selectionColorSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+
+    static func compositeSelection(ground: CGImage, over: CGImage?,
+                                   mask: CIImage, state: SelectiveState,
+                                   showMask: Bool = false) -> CGImage? {
+        SelectiveMask.composite(ground: ground, selection: over, scene: nil,
+            state: state, subjects: nil, showMask: showMask, context: context,
+            colorSpace: selectionColorSpace, preparedMask: mask)
+    }
+
+    private static func developSelection(
+        _ scene: Scene, state: EditState, selection: SelectiveState,
+        detailMeasurements: DetailMeasurements?, collectHistogram: Bool,
+        hdr: Bool, dynamicRange: AppSettings.DynamicRange, exact: Bool,
+        stock: FilmStock?, negative: NegativeViewing?, report: Reporter?,
+        shouldContinue: (() -> Bool)?
+    ) -> (image: Rendered, histogram: [[Float]]?, hdrHistogram: [[Float]]?)? {
+        var base = state
+        base.selective = nil
+        guard shouldContinue?() != false,
+              let plain = selectionSource(scene),
+              let mask = selectionMask(scene, state: selection, source: plain),
+              let ground = develop(scene, state: base, detailMeasurements: detailMeasurements,
+                  hdr: hdr, dynamicRange: dynamicRange, exact: exact, stock: stock,
+                  negative: negative, report: report, shouldContinue: shouldContinue)?.image,
+              let over = develop(scene, state: selection.edit.applying(to: base),
+                  hdr: hdr, dynamicRange: dynamicRange, exact: exact, stock: stock,
+                  negative: negative, report: report, shouldContinue: shouldContinue)?.image,
+              shouldContinue?() != false else { return nil }
+        func blend(_ ground: CGImage, _ over: CGImage) -> CGImage? {
+            compositeSelection(ground: ground, over: over, mask: mask, state: selection)
+        }
+        guard let image = blend(ground.image, over.image) else { return nil }
+        var hdrImage: CGImage?
+        if let groundHDR = ground.hdrImage, let overHDR = over.hdrImage {
+            guard let blended = blend(groundHDR, overHDR) else { return nil }
+            hdrImage = blended
+        }
+        return (Rendered(image: image, hdrImage: hdrImage),
+                collectHistogram ? selectionHistogram(image) : nil,
+                collectHistogram ? hdrImage.map(selectionHistogram) : nil)
+    }
+
+    /// Count delivered channel values, just as the ordinary develop does, in bounded row storage.
+    private static func selectionHistogram(_ image: CGImage) -> [[Float]] {
+        var bins = [[Float]](repeating: [Float](repeating: 0, count: 64), count: 3)
+        let source = CIImage(cgImage: image, options: [.colorSpace: NSNull()])
+        let rows = min(64, image.height)
+        var pixels = [UInt16](repeating: 0, count: image.width * rows * 4)
+        for y in stride(from: 0, to: image.height, by: rows) {
+            let count = min(rows, image.height - y)
+            context.render(source, toBitmap: &pixels, rowBytes: image.width * 8,
+                bounds: CGRect(x: 0, y: y, width: image.width, height: count),
+                format: .RGBA16, colorSpace: nil)
+            for pixel in 0..<(image.width * count) {
+                for channel in 0..<3 { bins[channel][Int(pixels[pixel * 4 + channel]) >> 10] += 1 }
+            }
+        }
+        let peak = max(1, bins.flatMap { $0 }.max() ?? 1)
+        return bins.map { $0.map { $0 / peak } }
+    }
+
+    private static func developPlain(
+        _ scene: UnsafeBufferPointer<Float>,
+        width: Int, height: Int, options: FotufilmEngine.Options,
+        inputConversion: FilmInputConversion,
+        shouldContinue: (() -> Bool)?,
+        progress: (_ band: Int, _ count: Int) -> Void,
+        writeRows: (Range<Int>, UnsafeBufferPointer<Float>) -> Void
+    ) -> Bool {
+        var plain = PlainDevelop(options: options)
+        // The same band the neutral metering walks in, sized so a band is about a megabyte.
+        let bandRows = max(1, 262_144 / width)
+        var scratch = [Float](repeating: 0,
+                              count: min(bandRows, height) * width * 4)
+
+        func bands(
+            _ body: (Range<Int>, UnsafeMutableBufferPointer<Float>) -> Void
+        ) -> Bool {
+            var row = 0
+            while row < height {
+                if shouldContinue?() == false { return false }
+                let upper = min(height, row + bandRows)
+                scratch.withUnsafeMutableBufferPointer { buffer in
+                    expand(scene, rows: row..<upper, width: width, into: buffer,
+                           inputConversion: inputConversion)
+                    body(row..<upper, buffer)
+                }
+                row = upper
+            }
+            return true
+        }
+
+        if plain.needsToneBase {
+            var measurement = plain.toneBaseMeasurement(frameWidth: width,
+                                                        frameHeight: height)
+            guard bands({ rows, buffer in
+                measurement.add(linearRGBA: buffer.baseAddress!, rows: rows)
+            }) else { return false }
+            plain.setToneBase(measurement)
+        }
+
+        let count = (height + bandRows - 1) / bandRows
+        var band = 0
+        return bands { rows, buffer in
+            progress(band, count)
+            plain.apply(linearRGBA: buffer, rows: rows, width: width)
+            writeRows(rows, UnsafeBufferPointer(buffer))
+            band += 1
+        }
+    }
+
+    /// Develops one apron-bearing preview tile against measurements from its whole placed frame.
+    private static func developRegion(
+        _ scene: UnsafeBufferPointer<Float>,
+        width: Int, height: Int,
+        measurements: DetailMeasurements,
+        viewport: PreviewViewport,
+        film: (stock: FilmStock, engine: HalideMetalFilmRenderer),
+        options: FotufilmEngine.Options,
+        inputConversion: FilmInputConversion,
+        exactMath: Bool,
+        shouldContinue: (() -> Bool)?,
+        writeTile: (Range<Int>, Range<Int>, UnsafeBufferPointer<Float>) -> Void
+    ) -> Bool {
+        let density = viewport.densityReferencePixelSize
+        guard case let .builtIn(measured) = measurements.storage,
+              let context = film.engine.makeLinearFloatVirtualFrameContext(
+            measurements: measured,
+            densityWidth: max(1, Int(density.width)),
+            densityHeight: max(1, Int(density.height)),
+            frameWidth: Int(viewport.virtualFrameSize.width),
+            frameHeight: Int(viewport.virtualFrameSize.height),
+            stock: film.stock, options: options, exactMath: exactMath) else { return false }
+
+        if options.transportConstruction(for: film.stock) == nil {
+            // A zoom tile includes an apron that can be larger than the visible image at small
+            // gauges. Reuse export staging instead of allocating full-region Float32 buffers.
+            defer { HalideMetalFilmRenderer.releaseIdleBuffers() }
+            return film.engine.developRegionStreaming(
+                width: width, height: height,
+                originX: Int(viewport.origin.x), originY: Int(viewport.origin.y),
+                context: context, exactMath: exactMath, shouldContinue: shouldContinue,
+                readTile: { rows, columns, into in
+                    expand(scene, rows: rows, columns: columns, width: width,
+                           into: into, inputConversion: inputConversion)
+                }, writeTile: writeTile)
+        }
+        // Layered transport solves a complete virtual frame and owns its own resource schedule.
+        guard let device = MTLCreateSystemDefaultDevice() else { return false }
+        let regionCount = width * height * 4
+        guard let regionInput = device.makeBuffer(
+                length: regionCount * MemoryLayout<Float>.size,
+                options: .storageModeShared),
+              let regionOutput = device.makeBuffer(
+                length: regionCount * MemoryLayout<Float>.size,
+                options: .storageModeShared)
+        else { return false }
+
+        let regionDestination = UnsafeMutableBufferPointer(
+            start: regionInput.contents().assumingMemoryBound(to: Float.self),
+            count: regionCount)
+        expand(scene, rows: 0..<height, width: width,
+               into: regionDestination, inputConversion: inputConversion)
+
+        guard film.engine.processLinearFloatRegion(
+                input: regionInput, output: regionOutput,
+                regionWidth: width, regionHeight: height,
+                originX: Int(viewport.origin.x),
+                originY: Int(viewport.origin.y), context: context)
+        else { return false }
+
+        writeTile(0..<height, 0..<width, UnsafeBufferPointer(
+            start: regionOutput.contents().assumingMemoryBound(to: Float.self),
+            count: regionCount))
+        return true
+    }
+
+    /// Full-precision scene-linear rows copied to the strip buffer the kernel owns.
+    static func expand(_ scene: UnsafeBufferPointer<Float>,
+                       rows: Range<Int>, width: Int,
+                       into destination: UnsafeMutableBufferPointer<Float>,
+                       inputConversion: FilmInputConversion = .preserveHDR) {
+        let start = rows.lowerBound * width * 4
+        let count = rows.count * width * 4
+        SceneLinearInput.prepare(scene, from: start, count: count,
+                                 into: destination,
+                                 using: inputConversion)
+    }
+
+    /// The same for a block of the frame, packed `columns.count` wide in `destination`.
+    static func expand(_ scene: UnsafeBufferPointer<Float>,
+                       rows: Range<Int>, columns: Range<Int>, width: Int,
+                       into destination: UnsafeMutableBufferPointer<Float>,
+                       inputConversion: FilmInputConversion = .preserveHDR) {
+        guard columns != 0..<width else {
+            return expand(scene, rows: rows, width: width, into: destination,
+                          inputConversion: inputConversion)
+        }
+        let span = columns.count * 4
+        for row in rows {
+            let target = (row - rows.lowerBound) * span
+            SceneLinearInput.prepare(
+                scene, from: (row * width + columns.lowerBound) * 4, count: span,
+                into: UnsafeMutableBufferPointer(
+                    rebasing: destination[target..<(target + span)]),
+                using: inputConversion)
+        }
+    }
+
+    /// Regional log-luminance statistics of a decoded scene, metered
+    /// neutrally (balance 1, gain 1) — what the auto adjustment solves from.
+    static func regionStops(of scene: Scene) -> [Float] {
+        guard scene.width > 0, scene.height > 0 else { return [] }
+        var measurement = ToneBaseMeasurement(
+            frameWidth: scene.width, frameHeight: scene.height,
+            balance: SIMD3(1, 1, 1), exposureGain: 1)
+        let bandRows = max(1, 262_144 / scene.width)
+        var scratch = [Float](repeating: 0,
+                              count: min(bandRows, scene.height) * scene.width * 4)
+        scene.withPixels { pixels in
+            var row = 0
+            while row < scene.height {
+                let upper = min(scene.height, row + bandRows)
+                scratch.withUnsafeMutableBufferPointer { buffer in
+                    expand(pixels, rows: row..<upper, width: scene.width,
+                           into: buffer,
+                           inputConversion: scene.inputConversion)
+                    measurement.add(linearRGBA: buffer.baseAddress!,
+                                    rows: row..<upper)
+                }
+                row = upper
+            }
+        }
+        return measurement.regionStops()
+    }
+
+
+    /// Names the physical stages this stock and these options actually switch on, so the progress
+    /// UI describes the real pipeline rather than a fixed list.
+    static func activeStages(stock: FilmStock, options: FotufilmEngine.Options,
+                             width: Int, height: Int) -> String {
+        let invocation = FilmEngineInvocation(
+            stock: stock, options: options, width: width, height: height)
+        var names = ["Spectral exposure"]
+        let mask = invocation.featureMask
+        if mask & FilmEngineFeature.flare != 0 { names.append("veiling glare") }
+        if mask & FilmEngineFeature.mtf != 0 { names.append("emulsion diffusion") }
+        if mask & FilmEngineFeature.halation != 0 { names.append("halation") }
+        if mask & FilmEngineFeature.couplers != 0 { names.append("DIR couplers") }
+        if mask & FilmEngineFeature.adjacency != 0 { names.append("adjacency") }
+        names.append("H&D development")
+        if mask & FilmEngineFeature.grain != 0 { names.append("grain") }
+        names.append(stock.isReversal ? "transparency" : "RA-4 print")
+        return names.joined(separator: " · ")
+    }
+
+    /// Whether `scene` is a scanned negative that `state` reads as a film and prints.
+    static func printsScan(_ scene: Scene, state: EditState) -> Bool {
+        scene.scanMeasure != nil && state.hasFilm
+    }
+
+    /// The edit's framing of a picture: turned, flipped, straightened, tilted and cropped.
+    static func geometry(_ image: CIImage, state: EditState) -> CIImage {
+        var working = image
+        switch (state.rotation % 4 + 4) % 4 {
+        case 1: working = working.oriented(.right)
+        case 2: working = working.oriented(.down)
+        case 3: working = working.oriented(.left)
+        default: break
+        }
+        if state.flipH { working = working.oriented(.upMirrored) }
+        working = atOrigin(working)
+
+        if abs(state.straighten) > 0.001,
+           let filter = CIFilter(name: "CIStraightenFilter") {
+            filter.setValue(working, forKey: kCIInputImageKey)
+            filter.setValue(state.straighten * .pi / 180, forKey: kCIInputAngleKey)
+            if let output = filter.outputImage { working = atOrigin(output) }
+        }
+
+        if abs(state.perspectiveV) > 0.001 || abs(state.perspectiveH) > 0.001,
+           let filter = CIFilter(name: "CIPerspectiveTransform") {
+            let extent = working.extent
+            let corners = planeProjectedCorners(
+                of: extent, tiltV: state.perspectiveV,
+                tiltH: state.perspectiveH)
+            filter.setValue(working, forKey: kCIInputImageKey)
+            filter.setValue(CIVector(cgPoint: corners.topLeft),
+                            forKey: "inputTopLeft")
+            filter.setValue(CIVector(cgPoint: corners.topRight),
+                            forKey: "inputTopRight")
+            filter.setValue(CIVector(cgPoint: corners.bottomRight),
+                            forKey: "inputBottomRight")
+            filter.setValue(CIVector(cgPoint: corners.bottomLeft),
+                            forKey: "inputBottomLeft")
+            if let output = filter.outputImage {
+                working = atOrigin(output.cropped(to: extent))
+            }
+        }
+
+        if let corners = state.cornerCrop {
+            working = corners.applying(to: working)
+        }
+
+        if let crop = state.crop {
+            let extent = working.extent
+            let rect = CGRect(
+                x: extent.minX + crop.minX * extent.width,
+                y: extent.minY + crop.minY * extent.height,
+                width: crop.width * extent.width,
+                height: crop.height * extent.height
+            ).integral.intersection(extent)
+            if rect.width >= 8, rect.height >= 8 {
+                working = atOrigin(working.cropped(to: rect))
+            }
+        }
+        return working
+    }
+
+    private static func resample(_ image: CIImage, longEdge: Int?) -> CIImage {
+        guard let longEdge else { return image }
+        return atOrigin(downsample(image, longEdge: longEdge))
+    }
+
+    /// Resamples to an exact regional lattice. The viewport math keeps the aspect equal; the
+    /// aspect parameter below only absorbs integral crop rounding.
+    private static func resample(_ image: CIImage, pixelSize: CGSize) -> CIImage {
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0,
+              pixelSize.width > 0, pixelSize.height > 0,
+              let filter = CIFilter(name: "CILanczosScaleTransform") else {
+            return image
+        }
+        let scale = pixelSize.height / extent.height
+        filter.setValue(image, forKey: kCIInputImageKey)
+        filter.setValue(scale, forKey: kCIInputScaleKey)
+        filter.setValue(pixelSize.width / (extent.width * scale),
+                        forKey: kCIInputAspectRatioKey)
+        let resized = atOrigin(filter.outputImage ?? image)
+        return resized.cropped(to: CGRect(origin: .zero, size: pixelSize))
+    }
+
+    /// Band-limited reduction.
+    static func displayProxy(of source: PhotoSource,
+                             longEdge: Int) -> CGImage? {
+        guard let decoded = source.decoded(longEdge: longEdge,
+                                           decodeMode: .expandedHDR)
+        else { return nil }
+        return context.createCGImage(decoded, from: decoded.extent,
+                                     format: .RGBA8, colorSpace: outputSpace)
+    }
+
+    static func downsample(_ image: CIImage, longEdge: Int) -> CIImage {
+        ImageResampling.downsample(image, longEdge: longEdge)
+    }
+
+    private static func atOrigin(_ image: CIImage) -> CIImage {
+        image.transformed(by: CGAffineTransform(
+            translationX: -image.extent.minX, y: -image.extent.minY))
+    }
+
+    /// Where the frame's corners land once the picture plane tilts.
+    static func planeProjectedCorners(
+        of rect: CGRect, tiltV: Double, tiltH: Double
+    ) -> (topLeft: CGPoint, topRight: CGPoint,
+          bottomRight: CGPoint, bottomLeft: CGPoint) {
+        let quad = PerspectiveProjection.corners(width: rect.width, height: rect.height,
+                                                  vertical: tiltV, horizontal: tiltH)
+            .map { CGPoint(x: rect.minX + $0.x * rect.width, y: rect.maxY - $0.y * rect.height) }
+        return (quad[0], quad[1], quad[2], quad[3])
+    }
+
+}
+
+/// A picked photo, decoded on demand at whatever resolution is asked for.
+struct PhotoSource: @unchecked Sendable {
+    enum Kind: Sendable {
+        case raw
+        case raster
+        case bitmap
+        /// A scanned negative opened as a document (`NegativeDocument`).
+        case scan
+    }
+
+    enum DecodeMode: Sendable {
+        case expandedHDR
+        case coreImageToneMappedSDR
+    }
+
+    enum Payload {
+        case file(Data)
+        case bitmap(CGImage)
+        case scan(NegativeDocument)
+    }
+
+    /// Facts discovered once when the source enters the app. Rendering reads this value instead of
+    /// repeatedly reopening ImageIO and RAW containers during every preview and export.
+    struct Descriptor {
+        let kind: Kind
+        let contentType: UTType?
+        let originalName: String?
+        let pixelSize: CGSize
+        let orientation: CGImagePropertyOrientation
+        let asShotKelvin: Float?
+        var asShotChromaticity: SIMD2<Float>? = nil
+        let camera: CameraIdentity?
+        let captureMetadata: [String: Any]?
+        let lensShot: LensShot?
+        let sensorFrame: SensorFrame?
+        let declaredHeadroom: Float?
+        let sourceColorProfile: String?
+    }
+
+    struct OriginalFile: @unchecked Sendable {
+        let data: Data
+        let contentType: UTType?
+        let name: String?
+
+        var fileExtension: String {
+            if let name {
+                let suffix = (name as NSString).pathExtension
+                if !suffix.isEmpty { return suffix.lowercased() }
+            }
+            return contentType?.preferredFilenameExtension ?? "raw"
+        }
+    }
+
+    let payload: Payload
+    let descriptor: Descriptor
+    /// A concrete RAW UTI when the container cannot identify itself from its bytes.
+    let rawHint: String?
+
+    var data: Data? {
+        switch payload {
+        case .file(let data): return data
+        case .scan(let document): return document.original
+        case .bitmap: return nil
+        }
+    }
+    /// The scanned negative this source is, when it is one.
+    var scanDocument: NegativeDocument? {
+        guard case .scan(let document) = payload else { return nil }
+        return document
+    }
+    var isRaw: Bool { descriptor.kind == .raw }
+    var camera: CameraIdentity? { descriptor.camera }
+    var orientation: CGImagePropertyOrientation { descriptor.orientation }
+    var pixelSize: CGSize { descriptor.pixelSize }
+    var captureMetadata: [String: Any]? { descriptor.captureMetadata }
+    var lensShot: LensShot? { descriptor.lensShot }
+    var sensorFrame: SensorFrame? { descriptor.sensorFrame }
+    var takingAperture: UnexposedEdge.TakingAperture? {
+        UnexposedEdge.TakingAperture(capture: captureMetadata, sensor: sensorFrame)
+    }
+    var declaredHeadroom: Float? { descriptor.declaredHeadroom }
+    var originalFile: OriginalFile? {
+        guard let data else { return nil }
+        return OriginalFile(data: data, contentType: descriptor.contentType,
+                            name: descriptor.originalName)
+    }
+    var originalRaw: OriginalFile? { isRaw ? originalFile : nil }
+
+    /// Opens raw bytes, or returns nil if they are not camera raw.
+    static func raw(data: Data, hint: String?, name: String? = nil) -> PhotoSource? {
+        guard let raw = RawDecode.metadata(data: data, identifierHint: hint)
+        else { return nil }
+        let properties = imageProperties(data)
+        let contentType = resolvedContentType(data: data, hint: hint)
+        let capture = captureMetadata(from: properties)
+        return PhotoSource(
+            payload: .file(data),
+            descriptor: Descriptor(
+                kind: .raw, contentType: contentType, originalName: name,
+                pixelSize: raw.pixelSize, orientation: .up,
+                asShotKelvin: raw.asShotKelvin, asShotChromaticity: raw.asShotChromaticity,
+                camera: raw.camera,
+                captureMetadata: capture, lensShot: lensShot(from: capture),
+                sensorFrame: SensorFrame.read(data: data, identifierHint: contentType?.identifier ?? hint),
+                declaredHeadroom: nil,
+                sourceColorProfile: properties?[kCGImagePropertyProfileName as String]
+                    as? String),
+            rawHint: contentType?.identifier ?? hint)
+    }
+
+    /// Opens anything else — a JPEG, a HEIC, a gain-map HDR photo.
+    static func file(data: Data, name: String? = nil) -> PhotoSource {
+        let properties = imageProperties(data)
+        let orientation = (properties?[kCGImagePropertyOrientation as String]
+            as? NSNumber).flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
+            ?? .up
+        let extent = CIImage(data: data)?.extent.size ?? .zero
+        let pixelSize: CGSize
+        switch orientation {
+        case .left, .leftMirrored, .right, .rightMirrored:
+            pixelSize = CGSize(width: extent.height, height: extent.width)
+        default:
+            pixelSize = extent
+        }
+        let capture = captureMetadata(from: properties)
+        return PhotoSource(
+            payload: .file(data),
+            descriptor: Descriptor(
+                kind: .raster,
+                contentType: resolvedContentType(data: data, hint: nil),
+                originalName: name, pixelSize: pixelSize,
+                orientation: orientation, asShotKelvin: nil, camera: nil,
+                captureMetadata: capture, lensShot: lensShot(from: capture),
+                sensorFrame: SensorFrame.read(data: data),
+                declaredHeadroom: GainMapHeadroom.declared(data: data),
+                sourceColorProfile: properties?[kCGImagePropertyProfileName as String]
+                    as? String),
+            rawHint: nil)
+    }
+
+    /// A scanned negative, which the scene reads through its edit's reading.
+    static func scan(_ document: NegativeDocument) -> PhotoSource {
+        PhotoSource(
+            payload: .scan(document),
+            descriptor: Descriptor(
+                kind: .scan,
+                contentType: document.typeHint.flatMap(UTType.init)
+                    ?? resolvedContentType(data: document.original, hint: nil),
+                originalName: nil, pixelSize: document.size, orientation: .up,
+                asShotKelvin: nil, camera: nil, captureMetadata: nil, lensShot: nil,
+                sensorFrame: nil, declaredHeadroom: nil, sourceColorProfile: nil),
+            rawHint: document.typeHint)
+    }
+
+    static func bitmap(_ image: CGImage) -> PhotoSource {
+        PhotoSource(
+            payload: .bitmap(image),
+            descriptor: Descriptor(
+                kind: .bitmap, contentType: nil, originalName: nil,
+                pixelSize: CGSize(width: image.width, height: image.height),
+                orientation: .up, asShotKelvin: nil, camera: nil,
+                captureMetadata: nil, lensShot: nil, sensorFrame: nil,
+                declaredHeadroom: nil,
+                sourceColorProfile: image.colorSpace?.name.map { $0 as String }),
+            rawHint: nil)
+    }
+
+    var detail: String {
+        switch descriptor.kind {
+        case .raw: return "camera raw"
+        case .raster: return "image file"
+        case .bitmap: return "bitmap"
+        case .scan: return "scanned negative"
+        }
+    }
+
+    /// The untouched bytes when the source is specifically a DNG.
+    var originalDNGData: Data? {
+        guard let originalRaw,
+              originalRaw.contentType?.preferredFilenameExtension?.lowercased() == "dng"
+        else { return nil }
+        return originalRaw.data
+    }
+
+    private static func resolvedContentType(data: Data, hint: String?) -> UTType? {
+        let hinted = hint.flatMap(UTType.init)
+        if hinted?.conforms(to: .rawImage) == true, hinted != .rawImage {
+            return hinted
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let identifier = CGImageSourceGetType(source) as String?
+        else { return hinted }
+        return UTType(identifier) ?? hinted
+    }
+
+    private static func imageProperties(_ data: Data) -> [String: Any]? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [String: Any] else { return nil }
+        return properties
+    }
+
+    private static func captureMetadata(
+        from properties: [String: Any]?
+    ) -> [String: Any]? {
+        guard let properties else { return nil }
+        var kept: [String: Any] = [:]
+        for key in [kCGImagePropertyExifDictionary,
+                    kCGImagePropertyExifAuxDictionary,
+                    kCGImagePropertyTIFFDictionary,
+                    kCGImagePropertyGPSDictionary] {
+            guard var dictionary = properties[key as String] as? [String: Any]
+            else { continue }
+            if key == kCGImagePropertyTIFFDictionary {
+                dictionary[kCGImagePropertyTIFFOrientation as String] = nil
+            }
+            if key == kCGImagePropertyExifDictionary {
+                dictionary[kCGImagePropertyExifPixelXDimension as String] = nil
+                dictionary[kCGImagePropertyExifPixelYDimension as String] = nil
+            }
+            kept[key as String] = dictionary
+        }
+        return kept.isEmpty ? nil : kept
+    }
+
+    private static func lensShot(from metadata: [String: Any]?) -> LensShot? {
+        LensShot(capture: metadata)
+    }
+
+    /// Decodes to scene-linear, optionally capped at `longEdge` pixels. `neutralKelvin` names the
+    /// illuminant a raw demosaic should balance for; `RawDecode` holds that reasoning, and every
+    /// other decision the decode makes, so this path and the CLI's cannot drift apart.
+    func decoded(longEdge: Int? = nil, neutralKelvin: Float? = nil,
+                 upright: Bool = true,
+                 decodeMode: DecodeMode = .expandedHDR,
+                 correctingLens: Bool? = nil) -> CIImage? {
+        var decoded: CIImage?
+        if case .scan(let document) = payload {
+            // The scan as scanned: what a picture of the negative itself shows.
+            decoded = document.image
+        } else if isRaw, let data {
+            decoded = RawDecode.image(data: data, identifierHint: rawHint,
+                                      recipe: RawDecode.Recipe(
+                                        neutralKelvin: neutralKelvin,
+                                        targetLongEdge: longEdge,
+                                        correctsLens: correctingLens))
+        } else if let data {
+            switch decodeMode {
+            case .coreImageToneMappedSDR:
+                decoded = CIImage(data: data, options: [.toneMapHDRtoSDR: true])
+            case .expandedHDR:
+                decoded = CIImage(data: data, options: [.expandToHDR: true])
+                    ?? CIImage(data: data)
+            }
+            if upright, orientation != .up {
+                decoded = decoded?.oriented(orientation)
+            }
+        } else if case .bitmap(let image) = payload {
+            decoded = CIImage(cgImage: image)
+        }
+        guard var output = decoded else { return nil }
+        if let longEdge {
+            output = FilmRender.downsample(output, longEdge: longEdge)
+        }
+        return output.transformed(by: CGAffineTransform(
+            translationX: -output.extent.minX, y: -output.extent.minY))
+    }
+}
+
+/// A finished render.
+struct Rendered {
+    let image: CGImage
+
+    /// The same print encoded with the HDR shoulder and HLG, when one was asked for.
+    var hdrImage: CGImage?
+
+    /// The negative's own record — camera, lens, exposure, place — carried
+    /// from the source file into whatever the writers below produce.
+    var metadata: [String: Any]? = nil
+
+    /// Which way the print's rows stand, written into the file the way the
+    /// camera's own photographs carry it.
+    var orientation = CGImagePropertyOrientation.up
+
+    /// Where the photograph sits when the print is framed, in Core Graphics coordinates with the
+    /// origin at the lower left; nil when the print is the photograph alone. A mark meant for the
+    /// picture rather than its border goes inside this.
+    var photoRect: CGRect? = nil
+
+    var pixelSize: CGSize {
+        CGSize(width: image.width, height: image.height)
+    }
+
+    /// A small copy for display, so a 33 MP export is never hosted by a view.
+    func thumbnailImage(maxDimension: CGFloat) -> CGImage? {
+        let longest = CGFloat(max(image.width, image.height))
+        guard longest > maxDimension else { return image }
+        let scale = maxDimension / longest
+        let width = Int((CGFloat(image.width) * scale).rounded())
+        let height = Int((CGFloat(image.height) * scale).rounded())
+        guard let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.displayP3)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
+    /// What an HDR photograph is written as.
+    enum HDRContainer: String, Sendable {
+        /// A 10-bit Display P3 SDR base plus a gain map derived from the pair, which is what the
+        /// iPhone's own camera writes.
+        case gainMap
+        /// A single 10-bit HLG layer.
+        case hlg
+
+        /// Whether this device can write it at all.
+        var isAvailable: Bool {
+            switch self {
+            case .gainMap:
+                if #available(macOS 15, *) { return true }
+                return false
+            case .hlg:
+                return true
+            }
+        }
+    }
+
+    private static let hdrContext = CIContext(options: [.cacheIntermediates: false])
+
+    @discardableResult
+    func metadata(applying policy: ExportMetadataPolicy) -> [String: Any]? {
+        guard var carried = metadata, policy != .strip else { return nil }
+        if policy == .preserveWithoutLocation {
+            carried[kCGImagePropertyGPSDictionary as String] = nil
+        }
+        return carried.isEmpty ? nil : carried
+    }
+
+    private func annotated(_ base: CIImage,
+                           metadata policy: ExportMetadataPolicy) -> CIImage {
+        var carried = metadata(applying: policy) ?? [:]
+        if orientation != .up {
+            carried[kCGImagePropertyOrientation as String] = orientation.rawValue
+        }
+        guard !carried.isEmpty else { return base }
+        return base.settingProperties(
+            base.properties.merging(carried) { _, kept in kept })
+    }
+
+    @discardableResult
+    func writeHDR(to url: URL, as container: HDRContainer,
+                  metadata policy: ExportMetadataPolicy) -> Bool {
+        guard let hdrImage else { return false }
+        try? FileManager.default.removeItem(at: url)
+        let hdr = CIImage(cgImage: hdrImage)
+        switch container {
+        case .hlg:
+            guard let space = FilmRender.hdrSpace else { return false }
+            return (try? Self.hdrContext.writeHEIF10Representation(
+                of: annotated(hdr, metadata: policy), to: url, colorSpace: space,
+                options: [:])) != nil
+        case .gainMap:
+            guard #available(iOS 18, macOS 15, *) else { return false }
+            let sdr = annotated(CIImage(cgImage: image), metadata: policy)
+            return (try? Self.hdrContext.writeHEIFRepresentation(
+                of: sdr, to: url, format: .RGB10,
+                colorSpace: FilmRender.outputSpace,
+                options: [.hdrImage: hdr, .hdrGainMapAsRGB: true])) != nil
+        }
+    }
+
+    /// A Cineon Log print as a 10-bit DPX (`CineonDPX`): its code values read back exactly as the
+    /// develop wrote them, with no colour management, and turned upright, since a DPX carries
+    /// no orientation a grading suite reads.
+    func writeDPX(to url: URL, film: CineonDPX.Film = CineonDPX.Film()) throws {
+        let upright = CIImage(cgImage: image).oriented(orientation)
+        let extent = upright.extent.integral
+        let width = Int(extent.width), height = Int(extent.height)
+        var signals = [Float](repeating: 0, count: width * height * 4)
+        signals.withUnsafeMutableBytes { buffer in
+            Self.signalContext.render(upright, toBitmap: buffer.baseAddress!, rowBytes: width * 16,
+                                      bounds: extent, format: .RGBAf, colorSpace: nil)
+        }
+        let data = signals.withUnsafeBufferPointer {
+            CineonDPX.encode(signals: $0, width: width, height: height, film: film)
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
+    /// Unmanaged and in full float, so a code value comes back as the number it was.
+    private static let signalContext = CIContext(options: [
+        .workingColorSpace: NSNull(), .outputColorSpace: NSNull(), .workingFormat: CIFormat.RGBAf,
+    ])
+
+}

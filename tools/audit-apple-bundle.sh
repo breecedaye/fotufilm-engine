@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Release boundary: fail before signing/publishing if repository-only material reached an app.
+set -euo pipefail
+
+BUNDLE="${1:?usage: $0 <app-or-plugin-bundle>}"
+[[ -d "$BUNDLE" ]] || { echo "error: bundle not found: $BUNDLE" >&2; exit 1; }
+
+failures=0
+report() {
+  echo "error: $*" >&2
+  failures=$((failures + 1))
+}
+
+while IFS= read -r path; do
+  report "repository-only file reached the bundle: $path"
+done < <(find "$BUNDLE" \( \
+  -iname 'readme*' -o -name '*.swift' -o -name '*.swiftinterface' \
+  -o -name '*.swiftmodule' -o -name '*.h' -o -name '*.hpp' -o -name '*.modulemap' \
+  -o -name '*.dSYM' -o -name '.DS_Store' -o -name '._*' \
+  \) -print)
+
+while IFS= read -r directory; do
+  python3 "$(dirname "$0")/verify-film-profiles.py" "$directory" || report "invalid film profiles: $directory"
+done < <(find "$BUNDLE" -type d -name Stocks -print)
+
+while IFS= read -r pack; do
+  report "film pack reached the bundle: $pack"
+done < <(find "$BUNDLE" -type f -name '*.fotufilmpack' -print)
+
+# Every engine resource root carries the film profiles. SwiftPM owns the recovery prior in its
+# resource bundle, while the containing app owns the profiles; hand-assembled app and plug-in
+# roots keep both together.
+while IFS= read -r coefficient; do
+  resources="$(dirname "$coefficient")"
+  [[ -d "$resources/Stocks" ]] && continue
+  [[ "$resources" == *_FotufilmCore.bundle ]] && \
+    find "$BUNDLE" -type d -name Stocks -print -quit | grep -q . && continue
+  report "$resources is missing the film profiles"
+done < <(find "$BUNDLE" -type f -name rec2020-reflectance-prior.coeff -print)
+
+# Camera JSON is public upstream data. It keeps its CameraProfiles directory only where the
+# resources are copied; SwiftPM's .process flattens them into the root of the generated
+# Fotufilm_FotufilmCore.bundle, which is what an app consuming FotufilmCore as a package embeds.
+# BundledCameraProfiles.swift reads them from exactly there under SWIFT_PACKAGE, so a flat layout
+# is the shipping arrangement rather than a packaging slip. Xcode also emits version.json inside
+# signed App Intents metadata directories; it describes the generated metadata format, not
+# repository content. The Flutter editor's assets hold its asset and font manifests and the
+# public control catalogue and symbol list it is built from (flutter/tool/prepare.sh).
+while IFS= read -r json; do
+  [[ "$json" == */Stocks/*.json || \
+     "$json" == */CameraProfiles/*.json || \
+     "$json" == *_FotufilmCore.bundle/*.json || \
+     "$json" == */Metadata.appintents/version.json || \
+     "$json" == */App.framework/Versions/A/Resources/flutter_assets/*.json || \
+     "$json" == */"Chromium Embedded Framework.framework/Libraries/vk_swiftshader_icd.json" ]] || \
+    report "unexpected plaintext JSON reached the bundle: $json"
+done < <(find "$BUNDLE" -type f -name '*.json' -print)
+
+if ! python3 "$(dirname "$0")/audit-bundle-paths.py" "$BUNDLE"; then
+  failures=$((failures + 1))
+fi
+
+(( failures == 0 )) || exit 1
+echo "Audited $BUNDLE: no authoring files, unapproved stock resources, or local build paths."

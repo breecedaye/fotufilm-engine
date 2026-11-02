@@ -1,0 +1,131 @@
+#if canImport(CoreImage)
+import CoreImage
+import CoreGraphics
+import Foundation
+
+/// Resampling used on the way into the film model.
+public enum ImageResampling {
+    /// Reduces `image` so its long edge is `longEdge` pixels, band-limiting
+    /// first. `CILanczosScaleTransform` alone is not safe here.
+    public static func downsample(_ image: CIImage, longEdge: Int) -> CIImage {
+        let current = max(image.extent.width, image.extent.height)
+        let scale = CGFloat(longEdge) / current
+        guard current > 0, scale < 1, abs(current - CGFloat(longEdge)) > 0.5 else {
+            return image
+        }
+        var working = image
+        let weight = min(max((scale - 0.5) / 0.25, 0), 1)
+        let radius = 0.55 / scale * weight
+        if radius > 0.05, let blur = CIFilter(name: "CIGaussianBlur") {
+            blur.setValue(working.clampedToExtent(), forKey: kCIInputImageKey)
+            blur.setValue(radius, forKey: kCIInputRadiusKey)
+            if let blurred = blur.outputImage {
+                working = blurred.cropped(to: image.extent)
+            }
+        }
+        guard let filter = CIFilter(name: "CILanczosScaleTransform") else { return working }
+        filter.setValue(working, forKey: kCIInputImageKey)
+        filter.setValue(scale, forKey: kCIInputScaleKey)
+        filter.setValue(1, forKey: kCIInputAspectRatioKey)
+        return filter.outputImage ?? working
+    }
+
+    /// Lanczos-only reference path used to measure the prefilter's effect.
+    public static func lanczosOnly(_ image: CIImage, longEdge: Int) -> CIImage {
+        let current = max(image.extent.width, image.extent.height)
+        guard current > 0, current > CGFloat(longEdge),
+              let filter = CIFilter(name: "CILanczosScaleTransform") else { return image }
+        filter.setValue(image, forKey: kCIInputImageKey)
+        filter.setValue(CGFloat(longEdge) / current, forKey: kCIInputScaleKey)
+        filter.setValue(1, forKey: kCIInputAspectRatioKey)
+        return filter.outputImage ?? image
+    }
+}
+#endif
+
+#if canImport(CoreImage)
+public extension ImageResampling {
+    /// Target pixels per synchronous Core Image render band.
+    static let defaultPixelsPerBand: Int = {
+        // Core Image's working set grows with the band: a 24 MP raw at 8 MP bands held over a
+        // gigabyte of GPU and malloc memory on an iPhone, at 1 MP about a third of that, and it
+        // rendered faster. Raw demosaic output depends on band boundaries because each region
+        // has a finite apron; the developed print moved by at most half an 8-bit step.
+        // `FOTUFILM_RASTER_BAND` is for controlled sweeps only.
+        if let raw = ProcessInfo.processInfo.environment["FOTUFILM_RASTER_BAND"],
+           let megapixels = Int(raw), megapixels > 0 {
+            return megapixels * 1_000_000
+        }
+        return 1_000_000
+    }()
+
+    /// Rasterises a Core Image graph into an interleaved float linear buffer, a band at a time.
+    static func rasterizeLinearFloat(
+        _ image: CIImage, width: Int, height: Int,
+        context: CIContext, colorSpace: CGColorSpace,
+        pixelsPerBand: Int = defaultPixelsPerBand
+    ) -> [Float]? {
+        guard width > 0, height > 0 else { return nil }
+        var pixels = [Float](repeating: 0, count: width * height * 4)
+        pixels.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            rasterizeLinearFloat(image, into: base, width: width, height: height,
+                                 context: context, colorSpace: colorSpace,
+                                 pixelsPerBand: pixelsPerBand)
+        }
+        return pixels
+    }
+
+    /// The caller-owned form. Raw and 16-bit inputs keep their distinguishable scene-linear
+    /// values until develop.
+    ///
+    /// With `sink`, each band is rendered into scratch memory and handed over instead of being
+    /// written into `destination` — for a destination whose pages are dearer to dirty than to
+    /// copy, a mapped file's.
+    static func rasterizeLinearFloat(
+        _ image: CIImage, into destination: UnsafeMutableRawPointer,
+        width: Int, height: Int,
+        context: CIContext, colorSpace: CGColorSpace,
+        pixelsPerBand: Int = defaultPixelsPerBand,
+        sink: ((_ band: UnsafeMutableRawPointer, _ byteOffset: Int, _ byteCount: Int) -> Void)?
+            = nil,
+        flush: ((_ byteOffset: Int, _ byteCount: Int) -> Void)? = nil
+    ) {
+        guard width > 0, height > 0 else { return }
+        let traced = ProcessInfo.processInfo.environment["FOTUFILM_STILL_TIMINGS"] != nil
+        let rowBytes = width * MemoryLayout<Float>.size * 4
+        let bandRows = max(1, min(height, pixelsPerBand / width))
+        let scratch = sink != nil
+            ? UnsafeMutableRawPointer.allocate(byteCount: bandRows * rowBytes, alignment: 16)
+            : nil
+        defer { scratch?.deallocate() }
+        var top = 0
+        while top < height {
+            let rows = min(bandRows, height - top)
+            let bounds = CGRect(
+                x: image.extent.minX,
+                y: image.extent.minY + CGFloat(height - top - rows),
+                width: CGFloat(width), height: CGFloat(rows))
+            let byteOffset = top * rowBytes
+            let byteCount = rows * rowBytes
+            let renderStart = Date()
+            let target = scratch ?? destination.advanced(by: byteOffset)
+            context.render(image, toBitmap: target,
+                           rowBytes: rowBytes, bounds: bounds,
+                           format: .RGBAf, colorSpace: colorSpace)
+            let deliverStart = Date()
+            if let sink, let scratch {
+                sink(scratch, byteOffset, byteCount)
+            } else {
+                flush?(byteOffset, byteCount)
+            }
+            if traced {
+                print(String(format: "  raster band %d rows at %d: render %.1f ms, deliver %.1f ms",
+                             rows, top, deliverStart.timeIntervalSince(renderStart) * 1000,
+                             Date().timeIntervalSince(deliverStart) * 1000))
+            }
+            top += rows
+        }
+    }
+}
+#endif

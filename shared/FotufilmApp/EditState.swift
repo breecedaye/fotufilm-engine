@@ -1,0 +1,768 @@
+import Foundation
+import CoreGraphics
+#if canImport(FotufilmImaging)
+import FotufilmImaging
+#endif
+
+#if canImport(FotufilmCore)
+import FotufilmCore
+#endif
+#if canImport(FotufilmEditModel)
+import FotufilmEditModel
+#endif
+
+/// A selectable film stock with UI metadata.
+struct StockPreset: Identifiable {
+    let id: String
+    let name: String
+    let subtitle: String
+    let stock: FilmStock
+
+    /// Whether the user made this film or was given it.
+    let isCustom: Bool
+
+    /// Keyed on the pack generation rather than a `let`: materialising a definition re-normalises
+    /// matrices and resamples spectra, too much for every view update, but a custom pack can arrive
+    /// while the app runs.
+    static var all: [StockPreset] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let generation = FilmStockPack.generation
+        if let cached, cachedGeneration == generation { return cached }
+
+        let installed = FilmStock.presetIDs.compactMap { id -> StockPreset? in
+            guard let definition = FilmStock.presetDefinitions[id] else {
+                return nil
+            }
+            return StockPreset(
+                id: id,
+                name: definition.name,
+                subtitle: definition.subtitle ?? "",
+                stock: definition.stock,
+                isCustom: FilmStock.origin(of: id)?.packID != nil
+            )
+        }
+
+        let ordered = installed.filter { !$0.isCustom && !$0.stock.isMonochrome }
+            + installed.filter { !$0.isCustom && $0.stock.isMonochrome }
+            + installed.filter { $0.isCustom && !$0.stock.isMonochrome }
+            + installed.filter { $0.isCustom && $0.stock.isMonochrome }
+
+        cached = ordered
+        cachedGeneration = generation
+        return ordered
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cached: [StockPreset]?
+    private static var cachedGeneration = -1
+
+    /// The film the house hands out: Gold 200, the everyday colour negative, which every build
+    /// may load. A pack without it falls back to the first film on the wall this build may load —
+    /// the purchase decides how deep into the catalogue "first" reaches, and a free launch must
+    /// not start on a film its own picker refuses.
+    static let houseStockID = "gold200"
+
+    static var houseDefaultID: String {
+        if all.contains(where: { $0.id == houseStockID }) {
+            return houseStockID
+        }
+        return all.first?.id ?? ""
+    }
+
+    /// What a new photograph starts on: the user's choice in settings, or the house default when
+    /// they have not made one — or when the choice names a film this build may not load, as a
+    /// refunded purchase leaves behind.
+    static var defaultID: String {
+        if let stored = AppSettings.storedStockID,
+           all.contains(where: { $0.id == stored }) {
+            return stored
+        }
+        return houseDefaultID
+    }
+
+    /// The camera with nothing loaded in it: the picture the sensor gives, kept the way the phone's
+    /// own camera would keep it.
+    static let noFilmID = "no-film"
+
+    /// What the viewfinder calls it.
+    static let noFilmName = "Normal"
+
+    /// And what it says for itself where there is room to, beside a pack whose films all say
+    /// something.
+    static let noFilmSubtitle = "The picture as the sensor gives it"
+
+    static func isNoFilm(_ stockID: String) -> Bool { stockID == noFilmID }
+
+    /// HDR is a delivery option for direct-positive film and Normal. Negative film still receives
+    /// the complete scene exposure range internally, but its positive output is SDR.
+    static func supportsHDRDelivery(for stockID: String) -> Bool {
+        if isNoFilm(stockID) { return true }
+        guard let stock = preset(id: stockID)?.stock else { return false }
+        return PrintPaper.screen.supportsHDRDelivery(for: stock)
+    }
+
+    /// The named stock, falling back to the first available one so that a stale id (a pack removed
+    /// since the id was persisted, say) still renders something.
+    static func preset(id: String) -> StockPreset? {
+        guard !isNoFilm(id) else { return nil }
+        return all.first { $0.id == id } ?? all.first
+    }
+
+    /// The gauge a stock opens on when the user has not asked for one — the gauge the pack says the
+    /// film is known on.
+    static func nativeFormatID(for stockID: String) -> String {
+        FilmFormat.nativeID(forStockID: preset(id: stockID)?.id ?? stockID)
+    }
+
+    /// What the camera opens on.
+    static var cameraDefaultID: String {
+        if let loaded = AppSettings.storedCameraStockID,
+           isNoFilm(loaded) || all.contains(where: { $0.id == loaded }) {
+            return loaded
+        }
+        let id = defaultID
+        return all.contains { $0.id == id } ? id : noFilmID
+    }
+}
+
+/// A film a surface can be loaded with, named for a list to offer it in.
+struct FilmChoice: Identifiable, Hashable {
+    let id: String
+    let name: String
+    /// What the film says for itself where a list has room for it; empty where it says nothing.
+    var subtitle: String = ""
+
+    /// Every stock the pack carries, in the pack's own order.
+    static var stocks: [FilmChoice] {
+        StockPreset.all.map {
+            FilmChoice(id: $0.id, name: $0.name, subtitle: $0.subtitle)
+        }
+    }
+
+    /// What the camera's wall offers: no film, then the pack.
+    static let cameraWall: [FilmChoice] = [noFilm] + stocks
+
+    /// The editor's list, which offers the same choice the camera does: an editor develops a
+    /// no-film photograph rather than refusing it.
+    static var editorWall: [FilmChoice] { [noFilm] + stocks }
+
+    /// What a scanned negative can be read as: Normal, and every film with a negative to read.
+    static var negativeWall: [FilmChoice] {
+        [noFilm] + stocks.filter { film in
+            StockPreset.preset(id: film.id).map { NegativeScanPrint.reads($0.stock) } ?? false
+        }
+    }
+
+    private static let noFilm = FilmChoice(id: StockPreset.noFilmID,
+                                           name: StockPreset.noFilmName,
+                                           subtitle: StockPreset.noFilmSubtitle)
+
+    /// What to call a loaded film.
+    static func name(for id: String) -> String {
+        if StockPreset.isNoFilm(id) { return StockPreset.noFilmName }
+        return StockPreset.preset(id: id)?.name ?? ""
+    }
+}
+
+/// One tile of a strip of developed thumbnails: a choice the photograph can be seen made with,
+/// one tile per choice, each developed through the same grade. The film strip's tiles are films
+/// on media; the lens strip's are filters.
+protocol StripChoice: Identifiable where ID == String {
+    /// The grade with what this kind of tile decides taken out of it. A run of prints is keyed on
+    /// the rest, so changing the very thing the strip offers does not throw the whole run away.
+    static func aside(_ grade: EditState) -> EditState
+    /// Makes the grade the one this tile is a picture of.
+    func develop(_ grade: inout EditState)
+}
+
+/// One tile of the editor's film strip: a film together with the medium it is finished on. The
+/// strip offers every finished look that makes sense for the pack, not every emulsion — a Vision
+/// negative on its release print and the same negative through a telecine are two different
+/// pictures, and the strip is where they are compared side by side. Normal is one tile, because
+/// the sensor's picture takes no medium.
+struct FilmMediumChoice: Identifiable, Hashable, StripChoice {
+    let film: FilmChoice
+    /// Nil for Normal, which nothing finishes.
+    let paper: PrintPaper?
+    /// What the tile calls the medium, when it calls it anything: a print or a transfer is
+    /// named, but the display — a film seen directly, a reversal's own positive — is the plain
+    /// film, and its tile carries the film's name alone.
+    let mediumName: String?
+
+    var id: String { paper.map { "\(film.id)|\($0.rawValue)" } ?? film.id }
+    var stockID: String { film.id }
+    var name: String { film.name }
+
+    /// Whether this tile is the one an edit stands on. `paper` is the edit's resolved medium.
+    func matches(stockID: String, paper: PrintPaper) -> Bool {
+        film.id == stockID && (self.paper == nil || self.paper == paper)
+    }
+
+    /// Every medium that makes sense for each film, film by film in the wall's order and medium by
+    /// medium in `PrintPaper.stripChoices(for:)` order — the one the film was made for first, then
+    /// video and display.
+    static func combinations(of films: [FilmChoice]) -> [FilmMediumChoice] {
+        films.flatMap { film -> [FilmMediumChoice] in
+            guard let stock = StockPreset.preset(id: film.id)?.stock else {
+                return [FilmMediumChoice(film: film, paper: nil, mediumName: nil)]
+            }
+            let gauge = FilmFormat.native(forStockID: film.id)
+            return PrintPaper.stripChoices(for: stock, gauge: gauge).map {
+                FilmMediumChoice(film: film, paper: $0,
+                                 mediumName: $0 == .screen ? nil : $0.name)
+            }
+        }
+    }
+
+    /// The pack's films on every medium they reach, for a strip with no filmless path.
+    static var stocks: [FilmMediumChoice] { combinations(of: FilmChoice.stocks) }
+
+    /// The editor's strip: Normal, then the pack on every medium.
+    static var editorWall: [FilmMediumChoice] { combinations(of: FilmChoice.editorWall) }
+
+    /// Each tile carries its own film and medium, so neither the loaded one nor the chosen one is
+    /// part of what a run of them is a picture of.
+    static func aside(_ grade: EditState) -> EditState {
+        var slice = grade
+        slice.stockID = ""
+        slice.paper = .editorDefault
+        slice.paperFollowsStock = false
+        return slice
+    }
+
+    /// Developed as if this film were the loaded one and this medium the chosen one — which is
+    /// also what picks the tile's gauge while the gauge is still the film's to choose.
+    func develop(_ grade: inout EditState) {
+        grade.stockID = stockID
+        // A tile names its medium outright, so the edit stops following the film's own.
+        if let paper {
+            grade.paper = paper
+            grade.paperFollowsStock = false
+        }
+    }
+}
+
+/// The complete, value-typed description of an edit.
+struct EditState: Equatable {
+    var selective: SelectiveState?
+    /// Set on a scanned negative opened as a document: how the scan is read. The film is the
+    /// edit's own (`stockID`); Normal reads the scan as a plain positive. Nil for a photograph.
+    var negative: WebNativeEdit.Negative?
+    /// Returns an openable copy, substituting the default stock when current purchase access does
+    /// not allow the stored stock. The persisted record remains unchanged.
+    func openableByPurchase() -> EditState {
+        self
+    }
+
+    var stockID = StockPreset.defaultID
+    /// The gauge the user asked for, or nil to let the film choose.
+    var chosenFormatID: String? = AppSettings.storedFormatID
+
+    /// Share of an HDR source's stops above white kept, and the strength of the highlight fit
+    /// that eases them into the film. Both stay with this edit.
+    var hdrRange = 1.0
+    var hdrRollOff = 1.0
+
+    var exposure = 0.0  // EV
+    /// Scene illuminant, in mireds so the slider is perceptually even.
+    var temperatureMired = Double(WhiteBalance.kelvinToMired(WhiteBalance.neutralKelvin))
+    /// Capture white recorded by the camera. Nil preserves an imported RAW's as-shot white.
+    /// Camera captures use the same scene-white neutralization in live preview and RAW decode.
+    var captureIlluminantKelvin: Double? = nil
+    /// Legacy camera-acquisition field. Kept for old documents and camera clients; it no longer
+    /// changes the RAW decode or implicitly selects the film's source illuminant.
+    var filmLightKelvin: Double? = nil
+    /// Index into the catalogue's stable source-light menu. Zero follows the selected stock.
+    var sourceLightIndex = 0
+    var sourceLightKelvin = 6504.0
+    /// Green/magenta offset from the locus, in units of 0.0001 delta-uv.
+    var tint = 0.0
+    /// Scene-referred tone shaping, -1...1 (0 = untouched).
+    var highlights = 0.0
+    var shadows = 0.0
+    /// Whether the tone controls key to each pixel's *regional* brightness (recovering a sky moves
+    /// the sky as one piece) rather than to the pixel itself.
+    var localTone = true
+    var cameraPreflash = 0.0
+    /// Chroma controls: saturation multiplies (1 = untouched), vibrance is a
+    /// signed boost weighted toward the least colourful pixels (0 =
+    /// untouched).
+    var saturation = 1.0
+    var vibrance = 0.0
+
+    /// The grade laid over the finished print: three bands of lift, gamma and gain.
+    var grade = ColorGrade.neutral
+    /// Whether that corrector works on the encoded signal rather than on light. Seeded from the
+    /// app-wide setting for the same reason `grainModel` is.
+    var encodedGrade = AppSettings.storedGradeSpace == .encoded
+
+    var grain = 1.0
+    /// The share of the published granularity's *variance* carried by the coarse mottle field
+    /// under the sharp grain, 0...0.9, or nil for whatever the stock's own sheet states.
+    var grainMottleShare: Double? = nil
+    /// Which grain model develops grain across the emulsion.
+    ///
+    /// On the Mac it is seeded from the app-wide setting, as the gauge is: an edit begun after the
+    /// Grain Model menu was changed starts where that setting stands, and then travels with the
+    /// photograph instead of following the device. iOS opens every film on Standard; the photo's
+    /// own Grain Model control picks another.
+    #if os(macOS)
+    var grainModel: GrainModel = AppSettings.storedGrainModel
+    #else
+    var grainModel: GrainModel = .clumpField
+    #endif
+    /// How the Film grain model lays its grain: the texture's size, the layers' shared colour
+    /// grain, each layer's share of the amount, and the scan's softness. Ignored by the others.
+    var filmGrainSize = 1.0
+    var filmColourGrain = 1.0
+    var filmRedLayer = 1.0
+    var filmGreenLayer = 1.0
+    var filmBlueLayer = 1.0
+    var filmScanSoftness = 1.0
+    var halation = 1.0
+    /// Nil follows the loaded film's returned/direct ratio.
+    var halationReturnRatio: Double? = nil
+    var resolvedHalationReturnRatio: Double {
+        halationReturnRatio ?? Double(stock?.halationStrength.first ?? 0)
+    }
+    /// How much the halo keeps the light's own colour instead of the film's layered red, 0…1.
+    var halationColour = 0.0
+    /// A gain on what the base returns at each wavelength, one value per handle of the
+    /// catalogue's ladder. Flat at 1 is the film's own return trip.
+    var halationSpectrum = EditState.restingHalationSpectrum
+    /// The base's impurity scatter in micrometers; 0 keeps the film's own.
+    var halationHaze = 0.0
+    /// Layered Transport's construction: the anti-halation layer's absorption and the base's
+    /// thickness as multiples of the film's, and a pressure plate's reflectance behind it.
+    var antiHalation = 1.0
+    var baseThickness = 1.0
+    var pressurePlate = 0.0
+    var couplers = 1.0
+    var chromaticFringeAmount = 0.0
+    /// Gaussian sigma on the film, displayed and persisted in micrometers.
+    var chromaticFringeRadius = 100.0
+    /// How far the released inhibitor crosses each interlayer, as a multiple of the stock's own
+    /// geometry: index 0 is the red–green scavenger, index 1 the green–blue yellow filter layer.
+    /// Seeded from the app-wide barriers, which is where this lived before it moved onto the edit.
+    var couplerGapReach = [AppSettings.storedCouplerBarrierRedGreen,
+                           AppSettings.storedCouplerBarrierGreenBlue]
+    /// The inhibition matrix's diagonal — adjacency within one layer rather than across two.
+    var couplerSelf = AppSettings.storedCouplerSelf
+    var printCorrection = Double(FotufilmEngine.Options().printCorrection)
+    var seed: UInt64 = 0x46494C4D
+
+    /// Filter IDs ordered from the lens front element outward. Order affects air-gap veiling glare;
+    /// uniform spectral absorption commutes with spatial diffusion.
+    var lensFilterIDs: [String] = []
+
+    /// How the exposure was set behind the fitted stack — the engine's three answers, surfaced
+    /// because they are the difference between a filter that shows and one that cancels. Metered
+    /// through is the default a TTL camera gives, and it makes a neutral density *exactly*
+    /// invisible: the meter sees the flat loss and the gain puts it all back. A photographer who
+    /// fits an ND to see it darken wants "none".
+    var lensFilterMetering: LensFilterCompensation = .throughTheLens
+
+    /// The lab's levers: stops of push (or pull) development, how much silver the
+    /// bleach leaves behind, and years past the roll's process-by date. All rest at
+    /// the datasheet's zero.
+    var push = 0.0
+    var bleach = 0.0
+    var expiredYears = 0.0
+    /// How long the shutter was open, for the stock's stated reciprocity failure. Nil is the
+    /// instantaneous exposure every edit has been developed as until now, and so is any time at or
+    /// under the sheet's threshold, where the law still holds.
+    var shutterSeconds: Double? = nil
+    /// The lamp a physical print is viewed under, in kelvin. Nil uses the medium reference:
+    /// D50 for reflection paper and calibrated 5400 K xenon for a cinema print. Digital media
+    /// ignore it.
+    var printLightKelvin: Double? = nil
+
+    /// Where the developed image is finished. Most choices form a positive; `.negative` keeps the
+    /// developed film itself as the output.
+    var paper = PrintPaper.editorDefault
+    /// The frame drawn around the print. A Cineon Log scan has none: its code values are not a
+    /// picture a frame drawn in display light belongs around, so the choice is kept and set
+    /// aside until the medium takes a frame again.
+    var printFrame: PrintFrame {
+        get { resolvedPaper.deliversCodeValues ? .none : chosenPrintFrame }
+        set { chosenPrintFrame = newValue }
+    }
+    var chosenPrintFrame = PrintFrame.none
+    /// Border Width: the frame's margin as a multiple of its preset, for the frames that have one.
+    var printFrameMargin = 1.0
+    /// Edge Printing and Frame Number: whether a film border shows the stock's edge printing,
+    /// and the frame number it and the DX barcode read.
+    var printFrameEdgePrinting = true
+    var printFrameNumber = FilmEdgePrinting.recordedFrameNumber
+    /// Where a film border's aperture sits on a photograph of another shape, across and down
+    /// from -1 to 1 (`PrintFrameConfiguration.framing`).
+    var printFrameFraming = SIMD2<Double>.zero
+    /// Frames: how many consecutive frames of the roll a film border's picture runs across.
+    var printFrameCount = 1
+    /// Camera: the camera a 135 film border's picture was exposed in.
+    var printFrameCamera = FilmBorderCamera.panoramic
+    /// How the developed negative is read when it is the output: on the light box with its
+    /// orange base, or through a scanner that divides the base out.
+    var negativeViewing = NegativeViewing.lightBox
+    /// An edit can explicitly follow the loaded stock's physical reference path: still negative
+    /// to RA-4 paper, motion negative to its native release print, and reversal to its direct
+    /// positive. New edits instead use the HDR-capable digital reference selected above.
+    var paperFollowsStock = false
+    /// The lamp house a reflection print is enlarged under. `.diffuser` is the sheets' own
+    /// diffuse read and changes nothing; `.condenser` prints a silver negative harder through
+    /// the Callier effect. Read only where `Enlarger.illuminates` the medium.
+    var digitalReference = EditState.defaultDigitalReference
+    var screenGrade = Double(FotufilmEngine.Options().screenGrade)
+    var screenExposure = Double(FotufilmEngine.Options().screenExposureEV)
+    var screenCyan = 0.0
+    var screenMagenta = 0.0
+    var screenYellow = 0.0
+    /// Digital Reference's receiver band peaks, in nanometres.
+    var screenRedBand = Double(ReceiverBands.paper.red)
+    var screenGreenBand = Double(ReceiverBands.paper.green)
+    var screenBlueBand = Double(ReceiverBands.paper.blue)
+    var labScanDodging = Double(FotufilmEngine.Options().labScanDodging)
+    var labScanLook = Double(FotufilmEngine.Options().labScanLook)
+    var enlarger = Enlarger.default
+    /// Retain lamp settings when switched off; older edits keep the original print model.
+    var printerEnabled = false
+    var printerProfile = PrinterProfile.simulatedTungsten
+    var printerPreflash = 0.0
+    /// Shadow and Highlight Detail, 0 to 1; printed wherever the medium has a print.
+    var shadowDetail = 0.0
+    var highlightDetail = 0.0
+    /// The release printer's lights, in printer points; read only on cinema print film.
+    var printerRed = Double(PrinterLights.centre)
+    var printerGreen = Double(PrinterLights.centre)
+    var printerBlue = Double(PrinterLights.centre)
+
+    var rotation = 0  // clockwise quarter turns, 0...3
+    var flipH = false
+    var straighten = 0.0  // degrees, -15 ... 15
+    /// The picture plane's keystone, in degrees, -15 ... 15 apiece.
+    var perspectiveV = 0.0
+    var perspectiveH = 0.0
+    /// Unit-space crop in the straightened frame; nil = full frame.
+    var crop: CGRect? = nil
+    var cornerCrop: QuadrilateralCrop? = nil
+    /// How far the camera had zoomed when it took this photograph, where it kept the whole sensor
+    /// reading and left the zoom to `crop`. That much of the crop is framing, as a longer lens
+    /// would give, rather than an enlargement of the negative.
+    var framingZoom = 1.0
+
+    /// RAW Corrections: false decodes a camera RAW without Core Image's lens correction, so its
+    /// distortion and vignetting show as captured.
+    var rawCorrections = true
+    /// Whether to apply lens correction. Disabled by default because correction resamples the image.
+    var lensCorrectionEnabled = false
+    /// The profile the photographer pinned, overriding what the metadata matched. Nil lets the
+    /// catalogue decide, which is what it does for almost every picture.
+    var lensProfileID: String? = nil
+    /// Fraction of the matched lens profile to apply, from 0 through 1.
+    var lensProfileAmount = 1.0
+    /// What the photographer dialled on top, which is all an unmatched lens gets.
+    var lensAdjustment = LensAdjustment.neutral
+
+    static let defaults = EditState()
+
+    /// A newly opened photograph's edit: the defaults, on the receiver bands chosen for new photos.
+    static func newPhoto() -> EditState {
+        var edit = EditState()
+        if let bands = AppSettings.startingReceiverBands {
+            edit.screenRedBand = bands.red
+            edit.screenGreenBand = bands.green
+            edit.screenBlueBand = bands.blue
+        }
+        return edit
+    }
+
+    /// The screen conversion new edits and the camera develop with: Graded Print on iPhone and
+    /// iPad, the engine's default elsewhere.
+    static let defaultDigitalReference: DigitalReferenceStyle = {
+        #if os(iOS)
+        return .gradedPrint
+        #else
+        return .default
+        #endif
+    }()
+
+    /// The flat return spectrum: the engine's own ladder, at rest.
+    ///
+    /// Taken from `HalationSpectrum` rather than from the row that draws it, so the storage
+    /// depends on the engine and not on the editor's vocabulary. The catalogue builds its handles
+    /// from the same place, and `EditorControlCatalogueTests` holds the two to each other — so
+    /// this cannot drift from the graph without a test saying so.
+    static let restingHalationSpectrum = HalationSpectrum.neutral.map(Double.init)
+
+    var hasGeometryEdits: Bool {
+        rotation != 0 || flipH || straighten != 0
+            || perspectiveV != 0 || perspectiveH != 0 || crop != nil || cornerCrop != nil
+    }
+
+    /// Everything about the lens correction that changes the pixels, gathered so that the render
+    /// key and the crop tool's own preview can ask the same question the same way.
+    struct LensSettings: Equatable {
+        var enabled: Bool
+        var profileID: String?
+        var profileAmount: Double
+        var adjustment: LensAdjustment
+    }
+
+    var lensSettings: LensSettings {
+        LensSettings(enabled: lensCorrectionEnabled, profileID: lensProfileID,
+                     profileAmount: lensProfileAmount,
+                     adjustment: lensAdjustment)
+    }
+
+    /// Whether anything about the lens has been said by hand. The switch itself is not an edit —
+    /// turning correction on is asking for the measurement, not overriding it.
+    var hasLensEdits: Bool {
+        !lensAdjustment.isNeutral || lensProfileAmount != 1
+            || lensProfileID != nil
+    }
+
+    mutating func resetLensCorrection() {
+        lensAdjustment = .neutral
+        lensProfileAmount = 1
+        lensProfileID = nil
+    }
+
+    /// Linked inhibitor reach. The getter uses the first gap; the setter updates every gap.
+    var couplerReach: Double {
+        get { couplerGapReach.first ?? 1 }
+        set {
+            couplerGapReach = [Double](repeating: newValue,
+                                       count: max(couplerGapReach.count, 2))
+        }
+    }
+
+    /// The gauge this edit actually develops on.
+    var formatID: String {
+        chosenFormatID ?? StockPreset.nativeFormatID(for: stockID)
+    }
+
+    /// True once the gauge is the user's rather than the film's, which is what a picker needs to
+    /// know to say so.
+    var followsStockGauge: Bool { chosenFormatID == nil }
+
+    /// The gauge this edit develops a photograph on, given what that photograph's file says it was
+    /// exposed on. Nobody having asked for a gauge, the camera's own frame answers before the film's
+    /// default does — see `FilmFormat.resolved`.
+    func resolvedFormat(sensor: SensorFrame?) -> FilmFormat {
+        FilmFormat.resolved(chosenID: chosenFormatID, sensor: sensor, stockID: stockID)
+    }
+
+    /// The preset a gauge picker should light up. The camera's answer is a preset like any other
+    /// now that a frame is matched to a gauge rather than used as one, so it lights up the gauge the
+    /// picture is genuinely being developed on.
+    func selectedFormatID(sensor: SensorFrame?) -> String? {
+        if let chosenFormatID { return chosenFormatID }
+        if let sensor { return sensor.gauge.id }
+        return StockPreset.nativeFormatID(for: stockID)
+    }
+
+    /// What the automatic row is following, said in one line for a picker: the camera where the file
+    /// measured the frame, the film otherwise.
+    func gaugeFollowingNote(sensor: SensorFrame?) -> String {
+        guard let sensor else {
+            let gauge = FilmFormat.native(forStockID: stockID).name
+            // Normal has no emulsion or native gauge, so describe the fallback as enlargement.
+            guard hasFilm else {
+                return "No film is selected. The default frame size is \(gauge)."
+            }
+            let name = StockPreset.preset(id: stockID)?.name ?? "This film"
+            return "\(name) uses \(gauge), and changing the film changes the format with it."
+        }
+        return """
+        The camera’s frame size is \(sensor.frameSize). Fotufilm uses the closest film format: \
+        \(sensor.gauge.format.name).
+        """
+    }
+
+    /// Pin the gauge to the user's choice.
+    mutating func selectFormat(_ id: String) { chosenFormatID = id }
+
+    /// Hand the gauge back to the film.
+    mutating func followStockGauge() { chosenFormatID = nil }
+
+    /// `nil` when no stock pack is installed, and in Normal, where there is no emulsion by choice.
+    var stock: FilmStock? { StockPreset.preset(id: stockID)?.stock }
+
+    /// Whether a film is loaded at all. False only in Normal — a stale id still means a film was
+    /// asked for — and it is what the film's own controls ask before offering themselves: its
+    /// character, its paper's correction, the develop sheet. Everything scene-referred still
+    /// applies either way.
+    var hasFilm: Bool { !StockPreset.isNoFilm(stockID) }
+
+    /// Whether this edit is a scanned negative read as its film and printed from the scan's
+    /// densities, as the desktop's `printsNegative` asks: the camera stages before the negative
+    /// existed (exposure, grain, halation, lens) have nothing to act on.
+    var printsNegative: Bool { negative != nil && hasFilm }
+
+    /// The medium this edit really develops on. Silence follows the stock's physical reference
+    /// path; an explicit selection is honoured wherever that stock can reach it, including
+    /// positive paper for a reversal transparency.
+    var resolvedPaper: PrintPaper {
+        guard let stock else { return paper }
+        if paperFollowsStock { return PrintPaper.default(for: stock) }
+        return paper.resolved(for: stock)
+    }
+
+    var frameConfiguration: PrintFrameConfiguration {
+        PrintFrameConfiguration(frame: printFrame, formatID: formatID,
+                                stockID: stockID, paper: resolvedPaper,
+                                viewingKelvin: printFrame.viewsTransparency ? nil : printLightKelvin.map(Float.init),
+                                negativeViewing: .lightBox, margin: printFrameMargin,
+                                frameNumber: printFrameNumber,
+                                showsEdgePrinting: printFrameEdgePrinting,
+                                framing: printFrameFraming, frames: printFrameCount,
+                                camera: printFrameCamera)
+    }
+
+    /// A negative stock is seen by transmission on the same reference light box as its rebate.
+    /// Direct-positive and integral film retain their developed positive image.
+    var filmFrameNegative: NegativeViewing? {
+        guard printFrame == .film, stock?.isReversal == false else { return nil }
+        let frame = frameConfiguration
+        return frame.frame == .film && frame.geometry?.isInstant == false ? .lightBox : nil
+    }
+
+    /// Photo framing changes the delivered medium without replacing the user's paper selection.
+    /// Use this derived state for photo previews, detail measurements and exports together.
+    var frameRenderState: EditState {
+        let slideInFilmFrame = stock?.isReversal == true && resolvedPaper.isPositivePaper
+            && frameConfiguration.frame.viewsTransparency
+        // The inverted scan's photograph is a positive: a negative output is scanned instead.
+        let scannedPositive = frameConfiguration.frame == .filmPositive && resolvedPaper.isNegative
+        guard filmFrameNegative != nil || slideInFilmFrame || scannedPositive else { return self }
+        var rendered = self
+        rendered.paper = scannedPositive ? .labScan : slideInFilmFrame ? .screen : .negative
+        rendered.paperFollowsStock = false
+        return rendered
+    }
+
+    /// Whether the selected film and medium can carry a local HDR output request. The app setting
+    /// decides the initial request when an editor opens; it does not remain a live dependency of
+    /// the edit. Negative film is always delivered as SDR.
+    var supportsHDROutput: Bool {
+        guard filmFrameNegative == nil, resolvedPaper.showsHDR,
+              StockPreset.supportsHDRDelivery(for: stockID) else { return false }
+        // A positive levelled by the screen conversion is normalised to SDR.
+        guard let stock else { return true }
+        return !resolvedPaper.levelsPositive(for: stock, digitalReference: digitalReference)
+    }
+
+    var whiteBalance: WhiteBalance {
+        WhiteBalance(kelvin: WhiteBalance.miredToKelvin(Float(temperatureMired)),
+                     tint: Float(tint))
+    }
+
+    /// Kelvin, for the slider's readout.
+    var temperatureKelvin: Double {
+        Double(WhiteBalance.miredToKelvin(Float(temperatureMired)))
+    }
+
+    /// Returns render options with the gauge resolved from the explicit edit, sensor, or film.
+    func options(sensor: SensorFrame?) -> FotufilmEngine.Options {
+        var o = options
+        o.format = resolvedFormat(sensor: sensor)
+        return o
+    }
+
+    var options: FotufilmEngine.Options {
+        var o = FotufilmEngine.Options()
+        for control in EditorControlCatalogue.all {
+            guard case .edit = control.scope, let binding = control.binding,
+                  control.persistence.encoding ?? .same == .same,
+                  let value = controlValue(of: control) else { continue }
+            binding.apply(value, to: &o)
+        }
+        o.whiteBalance = whiteBalance
+        o.sceneIlluminantKelvin = EditorControlCatalogue.sourceLightKelvin(
+            selection: sourceLightIndex, custom: sourceLightKelvin)
+        o.halationScale = Float(halation)
+        if hasFilm, let red = stock?.halationStrength.first, red > 0 {
+            o.halationReturnRatio = halationReturnRatio.map(Float.init)
+        } else {
+            o.halationReturnRatio = nil
+        }
+        o.grainMottleShare = grainMottleShare.map(Float.init)
+        o.halationModel = AppSettings.storedHalationModel
+        o.useEstimatedHalationProfile = AppSettings.storedEstimatedHalationEnabled
+        o.couplerGapReachScales = couplerGapReach.map(Float.init)
+        let fitted = FilterChoice.resolve(lensFilterIDs)
+        if !fitted.absorbing.isEmpty {
+            o.lensFilters = LensFilterStack(fitted.absorbing,
+                                            compensation: lensFilterMetering)
+        }
+        o.diffusionFilter = fitted.diffusion
+        if stock?.supportsDevelopment(stops: Float(push)) != true {
+            o.developmentEV = 0
+        }
+        o.shutterSeconds = shutterSeconds.map(Float.init)
+        o.printViewingKelvin = printLightKelvin.map(Float.init)
+        o.digitalReference = digitalReference
+        o.enlarger = enlarger
+        o.printer = printerEnabled ? printerProfile.normalized : nil
+        let outputMedium = resolvedPaper
+        o.paper = outputMedium
+        if outputMedium.isNegative {
+            o.negativeViewing = filmFrameNegative ?? negativeViewing
+        }
+        o.format = FilmFormat.preset(id: formatID) ?? .still35
+        o.seed = seed
+        return o
+    }
+
+    /// Whether the photograph's own shape is changed by this edit — the question an editor asks
+    /// before it puts the undeveloped original on screen, because a print of this state will not be
+    /// that shape.
+    var hasGeometry: Bool {
+        rotation != 0 || flipH || straighten != 0
+            || perspectiveV != 0 || perspectiveH != 0 || crop != nil || cornerCrop != nil
+    }
+
+    mutating func resetGeometry() {
+        rotation = 0
+        flipH = false
+        straighten = 0
+        perspectiveV = 0
+        perspectiveH = 0
+        crop = nil
+        cornerCrop = nil
+        framingZoom = 1
+    }
+
+    mutating func rerollGrain() {
+        seed = UInt64.random(in: UInt64.min...UInt64.max)
+    }
+}
+
+/// The crop tools' aspect choices.
+enum AspectOption: String, CaseIterable {
+    case free = "Free"
+    case original = "Original"
+    case square = "1:1"
+    case r4x5 = "4:5"
+    case r3x2 = "3:2"
+    case r16x9 = "16:9"
+
+    /// Locked width/height ratio for an image of the given size; ratios are oriented to match the
+    /// image (portrait images get portrait crops).
+    func ratio(for size: CGSize) -> CGFloat? {
+        let portrait = size.height > size.width
+        func oriented(_ a: CGFloat, _ b: CGFloat) -> CGFloat {
+            portrait ? min(a, b) / max(a, b) : max(a, b) / min(a, b)
+        }
+        switch self {
+        case .free: return nil
+        case .original:
+            return size.height > 0 ? size.width / size.height : nil
+        case .square: return 1
+        case .r4x5: return oriented(4, 5)
+        case .r3x2: return oriented(3, 2)
+        case .r16x9: return oriented(16, 9)
+        }
+    }
+}

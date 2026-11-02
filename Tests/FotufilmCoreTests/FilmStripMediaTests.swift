@@ -1,0 +1,59 @@
+import XCTest
+@testable import FotufilmCore
+
+final class FilmStripMediaTests: XCTestCase {
+    func testStillAndMotionGaugesOfferTheirOwnPrintVariants() {
+        for stock in [TestStocks.negative, TestStocks.monochrome] {
+            for gauge in [FilmFormat.still35, .mediumFormat120] {
+                XCTAssertEqual(PrintPaper.stripChoices(for: stock, gauge: gauge),
+                               [.ektacolorEdge, .enduraPremier, .crystalArchive, .screen])
+            }
+            for gauge in [FilmFormat.super35, .sixteenMM, .super8] {
+                XCTAssertEqual(PrintPaper.stripChoices(for: stock, gauge: gauge),
+                               [.vision2383, .vision2393, .eternaCP, .exr5386, .agfaCP30,
+                                .eternaCP3521XD, .telecine, .cineonLog, .screen])
+            }
+        }
+    }
+
+    func testStockNamesDoNotControlWhichPrintsAreAvailable() {
+        var stock = TestStocks.negative
+        let expected = PrintPaper.stripChoices(for: stock, gauge: .still35)
+        for name in ["Gold 200", "Portrait", "My custom film"] {
+            stock.name = name
+            XCTAssertEqual(PrintPaper.stripChoices(for: stock, gauge: .still35), expected)
+        }
+    }
+
+    func testNativeMediumLeadsOnlyWhenItBelongsToTheGauge() {
+        var stock = TestStocks.negative
+        stock.nativePrintMedium = .eternaCP
+        XCTAssertEqual(PrintPaper.stripChoices(for: stock, gauge: .super35),
+                       [.eternaCP, .vision2383, .vision2393, .exr5386, .agfaCP30,
+                        .eternaCP3521XD, .telecine, .cineonLog, .screen])
+        XCTAssertEqual(PrintPaper.stripChoices(for: stock, gauge: .still35),
+                       [.ektacolorEdge, .enduraPremier, .crystalArchive, .screen])
+        stock.nativePrintMedium = .enduraPremier
+        XCTAssertEqual(PrintPaper.stripChoices(for: stock, gauge: .still35),
+                       [.enduraPremier, .ektacolorEdge, .crystalArchive, .screen])
+    }
+
+    func testStripsAreUniqueAndEndOnTheDisplay() {
+        for stock in [TestStocks.negative, TestStocks.monochrome, TestStocks.reversal] {
+            for gauge in FilmFormat.presets.map(\.format) {
+                let media = PrintPaper.stripChoices(for: stock, gauge: gauge)
+                XCTAssertEqual(Set(media).count, media.count)
+                XCTAssertEqual(media.last, .screen)
+                XCTAssertFalse(media.contains(.labScan))
+                XCTAssertFalse(media.contains(.negative))
+            }
+        }
+    }
+
+    func testReversalOffersPositivePaperAndDirectViewingOnEveryGauge() {
+        for gauge in FilmFormat.presets.map(\.format) {
+            XCTAssertEqual(PrintPaper.stripChoices(for: TestStocks.reversal, gauge: gauge),
+                           [.ilfochromeCPS1K, .ilfochromeCLM1K, .screen])
+        }
+    }
+}

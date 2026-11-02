@@ -1,0 +1,298 @@
+// Browser entry point for the reference CPU pipeline.
+//
+// Mirrors `fotufilm_halide_process_strip` in Sources/FotufilmHalide/FotufilmHalide.cpp: develop the
+// negative into a density field, then print it. The two stages are separate AOT modules here
+// because they are separate pipelines there, and the variant each frame needs is chosen from the
+// feature mask exactly as `develop_pipeline_for` and `print_pipeline_for` choose it.
+//
+// Everything the kernels need beyond the image comes from the packed configuration, so the
+// JavaScript side never has to know the layout.
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "FotufilmHalide.h"
+#include "../../Sources/FotufilmHalide/FotufilmResolvedFrameParams.h"
+#include "FotufilmHalideDevelop.h"
+#include "FotufilmTransport.h"
+#include "transport.h"
+
+#include "fotufilm_wasm_variants.h"
+#if __has_include("develop_flexible.h")
+#include "develop_flexible.h"
+#include "develop_flexible_annular.h"
+#define FOTUFILM_WASM_FLEXIBLE 1
+#endif
+#include "print_0.h"
+#include "print_1.h"
+#include "print_2.h"
+#include "print_3.h"
+#include "plain_float.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE int fotufilm_wasm_plain_supported() { return 1; }
+static const int32_t kLutCount = 33 * 33 * 33 * 4;
+
+static int32_t max_i(int32_t a, int32_t b) { return a > b ? a : b; }
+
+static void init_planar(halide_buffer_t *buffer, halide_dimension_t *dims,
+                        float *host, int32_t width, int32_t height, int32_t channels) {
+    memset(buffer, 0, sizeof(*buffer));
+    dims[0].min = 0; dims[0].extent = width;  dims[0].stride = 1; dims[0].flags = 0;
+    dims[1].min = 0; dims[1].extent = height; dims[1].stride = width; dims[1].flags = 0;
+    if (channels > 0) {
+        dims[2].min = 0; dims[2].extent = channels;
+        dims[2].stride = width * height; dims[2].flags = 0;
+    }
+    buffer->host = (uint8_t *)host;
+    buffer->dim = dims;
+    buffer->dimensions = channels > 0 ? 3 : 2;
+    // Constructed rather than assigned field by field: Halide 22 split the language Type from the
+    // ABI halide_type_t and dropped `lanes` from the struct, but both versions take this ctor —
+    // 21 defaults the lanes away, 22 never had them.
+    buffer->type = halide_type_t(halide_type_float, 32);
+}
+
+static void init_flat(halide_buffer_t *buffer, halide_dimension_t *dim,
+                      float *host, int32_t count) {
+    memset(buffer, 0, sizeof(*buffer));
+    dim[0].min = 0; dim[0].extent = count; dim[0].stride = 1; dim[0].flags = 0;
+    buffer->host = (uint8_t *)host;
+    buffer->dim = dim;
+    buffer->dimensions = 1;
+    // Constructed rather than assigned field by field: Halide 22 split the language Type from the
+    // ABI halide_type_t and dropped `lanes` from the struct, but both versions take this ctor —
+    // 21 defaults the lanes away, 22 never had them.
+    buffer->type = halide_type_t(halide_type_float, 32);
+}
+
+/// Adds one Layered Transport component to the running sum, as fotufilm_transport_component
+/// does natively: `exposure` and `accumulated` are planar width * height * channels floats and
+/// `stencils` the component's table. Returns -1 for invalid input, or the Halide error code.
+EMSCRIPTEN_KEEPALIVE
+int fotufilm_wasm_transport(const float *exposure, float *accumulated, int32_t width, int32_t height,
+                            int32_t channels, const float *stencils) {
+    if (int32_t status = fotufilm_transport_validate(exposure, accumulated, width, height, channels,
+                                                     stencils, 0)) return status;
+    const int32_t plane = width * height;
+    float *output = (float *)malloc(size_t(plane) * channels * sizeof(float));
+    if (!output) return -1;
+    halide_buffer_t exposure_buf, sum_buf, table_buf, out_buf;
+    halide_dimension_t xd[3], sd[3], td[1], od[3];
+    init_planar(&exposure_buf, xd, const_cast<float *>(exposure), width, height, channels);
+    init_planar(&sum_buf, sd, accumulated, width, height, channels);
+    init_flat(&table_buf, td, const_cast<float *>(stencils), FOTUFILM_TRANSPORT_TABLE_FLOATS);
+    init_planar(&out_buf, od, output, width, height, channels);
+    int32_t r[FOTUFILM_TRANSPORT_LEVELS];
+    for (int l = 0; l < FOTUFILM_TRANSPORT_LEVELS; ++l) r[l] = (int32_t)stencils[l];
+    const int status = transport(&exposure_buf, &sum_buf, &table_buf, r[0], r[1], r[2], r[3], r[4],
+                                 r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], &out_buf);
+    if (status == 0) memcpy(accumulated, output, size_t(plane) * channels * sizeof(float));
+    free(output);
+    return status;
+}
+
+/// The film grain model's tiles for the stock on screen, as `fotufilm --dump-wasm-pack
+/// --grain-model film` writes them beside the pack: ((side + 1)², levels, 3) floats. One set is
+/// kept; a frame whose FILM_TILE block names another id, or none, binds the one-float stand-in.
+static float *film_tiles = nullptr;
+static int32_t film_tiles_id = -1;
+static float film_tiles_stand_in = 0.0f;
+static const int32_t kFilmTileEntries = (FOTUFILM_FILM_TILE_SIDE + 1) * (FOTUFILM_FILM_TILE_SIDE + 1);
+static const int32_t kFilmTileCount = kFilmTileEntries * FOTUFILM_FILM_TILE_LEVELS * 3;
+
+/// Copies `count` floats as tiles `id`; a null or empty source forgets them. Returns 0 on success.
+EMSCRIPTEN_KEEPALIVE
+int fotufilm_wasm_set_film_tiles(int32_t id, const float *tiles, int32_t count) {
+    free(film_tiles);
+    film_tiles = nullptr;
+    film_tiles_id = -1;
+    if (!tiles || count == 0) return 0;
+    if (count != kFilmTileCount) return -1;
+    film_tiles = (float *)malloc(size_t(count) * sizeof(float));
+    if (!film_tiles) return -1;
+    memcpy(film_tiles, tiles, size_t(count) * sizeof(float));
+    film_tiles_id = id;
+    return 0;
+}
+
+static void init_film_tiles(halide_buffer_t *buffer, halide_dimension_t *dims, bool on) {
+    memset(buffer, 0, sizeof(*buffer));
+    const int32_t extents[3] = {on ? kFilmTileEntries : 1, on ? FOTUFILM_FILM_TILE_LEVELS : 1,
+                                on ? 3 : 1};
+    int32_t stride = 1;
+    for (int d = 0; d < 3; ++d) {
+        dims[d].min = 0; dims[d].extent = extents[d]; dims[d].stride = stride; dims[d].flags = 0;
+        stride *= extents[d];
+    }
+    buffer->host = (uint8_t *)(on ? film_tiles : &film_tiles_stand_in);
+    buffer->dim = dims;
+    buffer->dimensions = 3;
+    buffer->type = halide_type_t(halide_type_float, 32);
+}
+
+/// Develops one frame, or one tile of a larger one. Input and output are planar float RGB —
+/// three width*height planes — and scene-referred at both ends; the sRGB transfer belongs to the
+/// caller. `origin_x` and `origin_y` say where the buffers sit in the frame, so a tile carrying
+/// the pack's `spatialSupport` as apron develops exactly as it would inside the whole frame; see
+/// fotufilm_wasm_render.
+///
+/// Returns 0 on success, or the Halide error code. -2 means no kernel was generated for this
+/// stock's feature mask.
+EMSCRIPTEN_KEEPALIVE
+int fotufilm_wasm_cpu_render(float *input, float *output, int32_t width, int32_t height,
+                            int32_t origin_x, int32_t origin_y,
+                            float *configuration, float *exposure_lut, float *film_lut,
+                            float *paper_lut, float *density, int32_t feature_mask,
+                            uint32_t seed) {
+    halide_buffer_t in_r, in_g, in_b, config_buf, exposure_buf, film_buf, paper_buf;
+    halide_buffer_t density_buf, out_buf;
+    halide_dimension_t dr[2], dg[2], db[2], dd[3], od[3];
+    halide_dimension_t cd[1], ed[1], fd[1], pd[1];
+
+    const int32_t plane = width * height;
+    init_planar(&in_r, dr, input, width, height, 0);
+    init_planar(&in_g, dg, input + plane, width, height, 0);
+    init_planar(&in_b, db, input + 2 * plane, width, height, 0);
+    init_planar(&density_buf, dd, density, width, height, 3);
+    init_planar(&out_buf, od, output, width, height, 3);
+    init_flat(&config_buf, cd, configuration, FOTUFILM_FRAME_CONFIGURATION_COUNT);
+    init_flat(&exposure_buf, ed, exposure_lut, kLutCount);
+    init_flat(&film_buf, fd, film_lut, kLutCount);
+    init_flat(&paper_buf, pd, paper_lut, kLutCount);
+
+    if (feature_mask & FOTUFILM_FRAME_NO_FILM)
+        return plain_float(&in_r, &in_g, &in_b, &config_buf, origin_x, origin_y, &out_buf);
+
+    const float *c = configuration;
+    const fotufilm::ResolvedFrameParams resolved(configuration, width, height, seed,
+        (feature_mask & FOTUFILM_FRAME_REVERSAL) != 0, origin_x, origin_y);
+    // Preserve the CPU Wasm ABI's existing luma-only bound.
+    const int32_t mtf_luma_radius = max_i(0, (int32_t)c[FOTUFILM_CONFIG_MTF_LUMA_RADIUS]);
+    const int32_t grain_mode = (int32_t)c[FOTUFILM_CONFIG_GRAIN_MODE];
+    const int32_t monochrome = (feature_mask & FOTUFILM_FRAME_MONOCHROME) != 0;
+    const bool film_on = grain_mode == 1 && film_tiles
+        && (int32_t)c[FOTUFILM_CONFIG_FILM_TILE + 2] == film_tiles_id;
+    halide_buffer_t film_tiles_buf;
+    halide_dimension_t ftd[3];
+    init_film_tiles(&film_tiles_buf, ftd, film_on);
+
+#define FOTUFILM_DEVELOP_ARGUMENTS \
+    &in_r, &in_g, &in_b, &config_buf, &exposure_buf, width, height, resolved.mtf_sigma_0, \
+    resolved.mtf_sigma_1, resolved.mtf_sigma_2, resolved.mtf_luma_sigma, resolved.mtf_radius_0, \
+    resolved.mtf_radius_1, resolved.mtf_radius_2, mtf_luma_radius, resolved.halation_stride_0, \
+    resolved.halation_stride_1, resolved.halation_stride_2, resolved.halation_strided_radius_0, \
+    resolved.halation_strided_radius_1, resolved.halation_strided_radius_2, resolved.coupler_sigma, \
+    resolved.coupler_radius, resolved.adjacency_sigma, resolved.adjacency_radius, \
+    resolved.adjacency_secondary_sigma, resolved.adjacency_secondary_radius, resolved.fringe_sigma, \
+    resolved.fringe_radius, resolved.grain_sigma, resolved.grain_radius, resolved.grain_lambda, \
+    resolved.print_mtf_radius, seed, resolved.reversal, monochrome, origin_x, origin_y, grain_mode, \
+    resolved.mottle_radius, resolved.mottle_lambda, resolved.diffusion_stride_0, \
+    resolved.diffusion_stride_1, resolved.diffusion_stride_2, resolved.diffusion_strided_radius_0, \
+    resolved.diffusion_strided_radius_1, resolved.diffusion_strided_radius_2, feature_mask, \
+    &film_tiles_buf, film_on ? 1 : 0, &density_buf
+
+    int status = 0;
+    if (feature_mask & FOTUFILM_FRAME_DENSITY_IN) {
+        // Native scan import starts at print with these measured densities.
+        memcpy(density, input, plane * 3 * sizeof(float));
+    } else switch (fotufilm_develop_variant(feature_mask)) {
+#include "fotufilm_wasm_variants.inc"
+    default:
+#if FOTUFILM_WASM_FLEXIBLE
+        if (feature_mask & (FOTUFILM_FRAME_DENSITY_IN | FOTUFILM_FRAME_TEXTURE
+                            | FOTUFILM_FRAME_RECORD_EXPOSURE_IN | FOTUFILM_FRAME_LIGHT_OUT)) return -2;
+        status = feature_mask & FOTUFILM_FRAME_HALATION_ANNULAR
+            ? develop_flexible_annular(FOTUFILM_DEVELOP_ARGUMENTS)
+            : develop_flexible(FOTUFILM_DEVELOP_ARGUMENTS);
+        break;
+#else
+        return -2;
+#endif
+    }
+#undef FOTUFILM_DEVELOP_ARGUMENTS
+    if (status != 0) return status;
+
+    if (feature_mask & FOTUFILM_FRAME_LIGHT_OUT) {
+        memcpy(output, density, plane * 3 * sizeof(float));
+        return 0;
+    }
+
+    switch ((resolved.reversal ? 1 : 0) | (monochrome ? 2 : 0)) {
+    case 0: return print_0(&density_buf, &config_buf, &film_buf, &paper_buf, &out_buf);
+    case 1: return print_1(&density_buf, &config_buf, &film_buf, &paper_buf, &out_buf);
+    case 2: return print_2(&density_buf, &config_buf, &film_buf, &paper_buf, &out_buf);
+    default: return print_3(&density_buf, &config_buf, &film_buf, &paper_buf, &out_buf);
+    }
+}
+
+// The configuration slots that are a pure function of a control. Anything that re-enters the film
+// model — halation, coupler range — needs a pack exported at that setting instead.
+/// The slot the frame's width lives in; its height is the next one. The browser writes the
+/// frame it is actually developing there, because a pack is sealed for one size and the kernel
+/// reads these for everything that spans the whole frame — the tone grid, the print's dither.
+EMSCRIPTEN_KEEPALIVE
+int32_t fotufilm_wasm_frame_size_slot(void) {
+    return FOTUFILM_CONFIG_FRAME_WIDTH;
+}
+
+#include "generated/fotufilm_wasm_controls.inc"
+
+EMSCRIPTEN_KEEPALIVE
+int32_t fotufilm_wasm_control_count(void) { return kFotufilmWasmControlCount; }
+
+EMSCRIPTEN_KEEPALIVE
+int32_t fotufilm_wasm_control_slot(int32_t index) {
+    return index >= 0 && index < kFotufilmWasmControlCount ? kFotufilmWasmControlSlots[index] : -1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void fotufilm_wasm_set_slot(float *configuration, int32_t slot, float value) {
+    if (slot >= 0 && slot < FOTUFILM_FRAME_CONFIGURATION_COUNT) configuration[slot] = value;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void fotufilm_wasm_set_exposure(float *configuration, float gain) {
+    configuration[FOTUFILM_CONFIG_EXPOSURE_GAIN] = gain;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void fotufilm_wasm_set_scene(float *configuration, float highlights, float shadows,
+                            float saturation, float vibrance) {
+    configuration[FOTUFILM_CONFIG_HIGHLIGHTS] = highlights;
+    configuration[FOTUFILM_CONFIG_SHADOWS] = shadows;
+    configuration[FOTUFILM_CONFIG_SATURATION] = saturation;
+    configuration[FOTUFILM_CONFIG_VIBRANCE] = vibrance;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void fotufilm_wasm_set_white_balance(float *configuration, float r, float g, float b) {
+    configuration[FOTUFILM_CONFIG_WHITE_BALANCE] = r;
+    configuration[FOTUFILM_CONFIG_WHITE_BALANCE + 1] = g;
+    configuration[FOTUFILM_CONFIG_WHITE_BALANCE + 2] = b;
+}
+
+/// Grain strength is stored per layer, already folded together with the stock's own weight and
+/// the aperture scale, so rescaling needs the amplitudes the pack was exported at.
+EMSCRIPTEN_KEEPALIVE
+void fotufilm_wasm_set_grain(float *configuration, const float *base, float scale) {
+    for (int layer = 0; layer < 3; ++layer) {
+        configuration[FOTUFILM_CONFIG_GRAIN + layer] = base[layer] * scale;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int fotufilm_wasm_configuration_count(void) { return FOTUFILM_FRAME_CONFIGURATION_COUNT; }
+
+EMSCRIPTEN_KEEPALIVE
+int fotufilm_wasm_lut_count(void) { return kLutCount; }
+
+}  // extern "C"

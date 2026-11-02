@@ -1,0 +1,191 @@
+import CoreGraphics
+import Foundation
+#if canImport(FotufilmImaging)
+import FotufilmImaging
+#endif
+#if canImport(FotufilmCore)
+import FotufilmCore
+#endif
+#if canImport(FotufilmEditModel)
+import FotufilmEditModel
+#endif
+
+private struct EditKey: CodingKey {
+    let stringValue: String
+    var intValue: Int? { nil }
+    init(_ name: String) { stringValue = name }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { nil }
+}
+
+extension EditState: Codable {
+    static var cataloguedKeys: [(control: EditorControl, key: String)] {
+        EditorControlCatalogue.all.compactMap { control in
+            guard case .edit = control.scope, let key = control.persistence.key else { return nil }
+            return (control, key)
+        }
+    }
+
+    static let bespokeKeys: [String] = [
+        "stockID", "chosenFormatID", "captureIlluminantKelvin",
+        "filmLightKelvin", "sourceLightIndex", "halationReturnRatio", "grainMottleShare", "grainModel", "couplerGapReach", "paper", "paperFollowsStock",
+        "seed", "shutterSeconds", "printLightKelvin", "printFrame", "printFrameNumber", "printFrameFraming", "printFrameCount", "printFrameCamera", "negativeViewing", "digitalReference", "enlarger", "printerProfile", "rotation", "crop", "cornerCrop", "framingZoom",
+        "grade", "lensProfileID", "lensAdjustment", "lensFilterIDs", "lensFilterMetering", "selective", "negative",
+    ]
+
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: EditKey.self)
+        for (control, key) in Self.cataloguedKeys {
+            let coding = EditKey(key)
+            switch control.field.access {
+            case .number:
+                if let stored = try c.decodeIfPresent(Double.self, forKey: coding) {
+                    setStoredValue(stored, of: control.field)
+                }
+            case .flag:
+                if let stored = try c.decodeIfPresent(Bool.self, forKey: coding) {
+                    setFlag(stored, of: control.field)
+                }
+            case .curve:
+                if let drawn = try c.decodeIfPresent([Double].self, forKey: coding),
+                   drawn.count == curve(of: control.field)?.count {
+                    setCurve(drawn, of: control.field)
+                }
+            case .optionalNumber(let path):
+                self[keyPath: path] = try c.decodeIfPresent(Double.self, forKey: coding)
+            case .derived, .bespoke, .unstored:
+                break
+            }
+        }
+        stockID = try c.decodeIfPresent(String.self, forKey: EditKey("stockID")) ?? stockID
+        chosenFormatID = try c.decodeIfPresent(String.self, forKey: EditKey("chosenFormatID"))
+        captureIlluminantKelvin = try c.decodeIfPresent(Double.self, forKey: EditKey("captureIlluminantKelvin"))
+        filmLightKelvin = try c.decodeIfPresent(Double.self, forKey: EditKey("filmLightKelvin"))
+        if let index = try c.decodeIfPresent(Int.self, forKey: EditKey("sourceLightIndex")) {
+            guard EditorControlCatalogue.sourceLights.indices.contains(index) else {
+                throw DecodingError.dataCorruptedError(forKey: EditKey("sourceLightIndex"),
+                    in: c, debugDescription: "Unknown source illuminant selection")
+            }
+            sourceLightIndex = index
+        } else if let legacy = filmLightKelvin {
+            // Preserve explicitly stored camera light in older edits. New edits always persist
+            // the selection, so acquisition metadata cannot opt them out of Stock Native.
+            sourceLightIndex = EditorControlCatalogue.sourceLights.firstIndex { $0.id == "custom" }!
+            sourceLightKelvin = legacy
+            // That field also took precedence over capture white in the old RAW decoder.
+            // Migrate the existing decode once; future source edits must not change it.
+            captureIlluminantKelvin = legacy
+        }
+        guard sourceLightKelvin.isFinite, (1000...25000).contains(sourceLightKelvin) else {
+            throw DecodingError.dataCorruptedError(forKey: EditKey("sourceLightKelvin"),
+                in: c, debugDescription: "Source illuminant must be between 1000 and 25000 K")
+        }
+        halationReturnRatio = try c.decodeIfPresent(Double.self, forKey: EditKey("halationReturnRatio"))
+        if let ratio = halationReturnRatio { try HalationReturn.validate(Float(ratio)) }
+        grainMottleShare = try c.decodeIfPresent(Double.self, forKey: EditKey("grainMottleShare"))
+        if let modelRaw = try c.decodeIfPresent(String.self, forKey: EditKey("grainModel")),
+           let model = GrainModel(rawValue: modelRaw) ?? GrainModel.named(modelRaw) {
+            grainModel = model
+        }
+        couplerGapReach = try c.decodeIfPresent([Double].self, forKey: EditKey("couplerGapReach"))
+            ?? couplerGapReach
+        paper = try c.decodeIfPresent(String.self, forKey: EditKey("paper"))
+            .flatMap(PrintPaper.preset(id:)) ?? .ektacolorEdge
+        paperFollowsStock = try c.decodeIfPresent(Bool.self, forKey: EditKey("paperFollowsStock")) ?? false
+        printFrame = try c.decodeIfPresent(PrintFrame.self, forKey: EditKey("printFrame")) ?? .none
+        printFrameNumber = try c.decodeIfPresent(Int.self, forKey: EditKey("printFrameNumber"))
+            .flatMap { FilmEdgePrinting.frameNumberRange.contains($0) ? $0 : nil }
+            ?? FilmEdgePrinting.recordedFrameNumber
+        if let framing = try c.decodeIfPresent([Double].self, forKey: EditKey("printFrameFraming")),
+           framing.count == 2, framing.allSatisfy({ $0.isFinite && abs($0) <= 1 }) {
+            printFrameFraming = SIMD2(framing[0], framing[1])
+        }
+        printFrameCount = try c.decodeIfPresent(Int.self, forKey: EditKey("printFrameCount"))
+            .flatMap { FilmBorderGeometry.frameCountRange.contains($0) ? $0 : nil } ?? 1
+        printFrameCamera = try c.decodeIfPresent(String.self, forKey: EditKey("printFrameCamera"))
+            .flatMap(FilmBorderCamera.init(rawValue:)) ?? .panoramic
+        negativeViewing = try c.decodeIfPresent(String.self, forKey: EditKey("negativeViewing"))
+            .flatMap(NegativeViewing.init(rawValue:)) ?? .lightBox
+        seed = try c.decodeIfPresent(UInt64.self, forKey: EditKey("seed")) ?? seed
+        shutterSeconds = try c.decodeIfPresent(Double.self, forKey: EditKey("shutterSeconds"))
+        printLightKelvin = try c.decodeIfPresent(Double.self, forKey: EditKey("printLightKelvin"))
+        digitalReference = try c.decodeIfPresent(DigitalReferenceStyle.self, forKey: EditKey("digitalReference"))
+            ?? EditState.defaultDigitalReference
+        enlarger = try c.decodeIfPresent(String.self, forKey: EditKey("enlarger"))
+            .flatMap(Enlarger.preset(id:)) ?? .default
+        printerProfile = try c.decodeIfPresent(PrinterProfile.self, forKey: EditKey("printerProfile"))?
+            .normalized ?? .simulatedTungsten
+        rotation = ((try c.decodeIfPresent(Int.self, forKey: EditKey("rotation")) ?? rotation) % 4 + 4) % 4
+        crop = try c.decodeIfPresent(CGRect.self, forKey: EditKey("crop"))
+        cornerCrop = try c.decodeIfPresent(QuadrilateralCrop.self, forKey: EditKey("cornerCrop"))
+        if cornerCrop?.isValid == false { cornerCrop = nil }
+        framingZoom = max(1, try c.decodeIfPresent(Double.self, forKey: EditKey("framingZoom")) ?? 1)
+        grade = try c.decodeIfPresent(ColorGrade.self, forKey: EditKey("grade")) ?? grade
+        selective = try c.decodeIfPresent(SelectiveState.self, forKey: EditKey("selective"))?.saved
+        negative = try c.decodeIfPresent(WebNativeEdit.Negative.self, forKey: EditKey("negative"))
+        lensProfileID = try c.decodeIfPresent(String.self, forKey: EditKey("lensProfileID"))
+        lensAdjustment = try c.decodeIfPresent(LensAdjustment.self, forKey: EditKey("lensAdjustment"))
+            ?? lensAdjustment
+        lensFilterIDs = try c.decodeIfPresent([String].self, forKey: EditKey("lensFilterIDs")) ?? lensFilterIDs
+        lensFilterMetering = try c.decodeIfPresent(String.self, forKey: EditKey("lensFilterMetering"))
+            .flatMap(LensFilterCompensation.init(rawValue:)) ?? lensFilterMetering
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: EditKey.self)
+        try c.encodeIfPresent(selective?.saved, forKey: EditKey("selective"))
+        try c.encodeIfPresent(negative, forKey: EditKey("negative"))
+        for (control, key) in Self.cataloguedKeys {
+            let coding = EditKey(key)
+            switch control.field.access {
+            case .number:
+                if let stored = storedValue(of: control.field) { try c.encode(stored, forKey: coding) }
+            case .flag:
+                if let on = flag(of: control.field) { try c.encode(on, forKey: coding) }
+            case .curve:
+                if let drawn = curve(of: control.field) { try c.encode(drawn, forKey: coding) }
+            case .optionalNumber(let path):
+                try c.encodeIfPresent(self[keyPath: path], forKey: coding)
+            case .derived, .bespoke, .unstored:
+                break
+            }
+        }
+        try c.encode(stockID, forKey: EditKey("stockID"))
+        try c.encodeIfPresent(chosenFormatID, forKey: EditKey("chosenFormatID"))
+        try c.encodeIfPresent(captureIlluminantKelvin, forKey: EditKey("captureIlluminantKelvin"))
+        try c.encodeIfPresent(filmLightKelvin, forKey: EditKey("filmLightKelvin"))
+        try c.encode(sourceLightIndex, forKey: EditKey("sourceLightIndex"))
+        try c.encodeIfPresent(halationReturnRatio, forKey: EditKey("halationReturnRatio"))
+        try c.encodeIfPresent(grainMottleShare, forKey: EditKey("grainMottleShare"))
+        try c.encode(grainModel.rawValue, forKey: EditKey("grainModel"))
+        try c.encode(couplerGapReach, forKey: EditKey("couplerGapReach"))
+        try c.encode(paper.id, forKey: EditKey("paper"))
+        try c.encode(paperFollowsStock, forKey: EditKey("paperFollowsStock"))
+        try c.encode(printFrame, forKey: EditKey("printFrame"))
+        try c.encode(printFrameNumber, forKey: EditKey("printFrameNumber"))
+        if printFrameCount != 1 { try c.encode(printFrameCount, forKey: EditKey("printFrameCount")) }
+        if printFrameCamera != .panoramic {
+            try c.encode(printFrameCamera.rawValue, forKey: EditKey("printFrameCamera"))
+        }
+        if printFrameFraming != .zero {
+            try c.encode([printFrameFraming.x, printFrameFraming.y], forKey: EditKey("printFrameFraming"))
+        }
+        try c.encode(negativeViewing.rawValue, forKey: EditKey("negativeViewing"))
+        try c.encode(seed, forKey: EditKey("seed"))
+        try c.encodeIfPresent(shutterSeconds, forKey: EditKey("shutterSeconds"))
+        try c.encodeIfPresent(printLightKelvin, forKey: EditKey("printLightKelvin"))
+        try c.encode(digitalReference, forKey: EditKey("digitalReference"))
+        try c.encode(enlarger.id, forKey: EditKey("enlarger"))
+        try c.encode(printerProfile.normalized, forKey: EditKey("printerProfile"))
+        try c.encode(rotation, forKey: EditKey("rotation"))
+        try c.encodeIfPresent(crop, forKey: EditKey("crop"))
+        try c.encodeIfPresent(cornerCrop, forKey: EditKey("cornerCrop"))
+        if framingZoom != 1 { try c.encode(framingZoom, forKey: EditKey("framingZoom")) }
+        try c.encode(grade, forKey: EditKey("grade"))
+        try c.encodeIfPresent(lensProfileID, forKey: EditKey("lensProfileID"))
+        try c.encode(lensAdjustment, forKey: EditKey("lensAdjustment"))
+        try c.encode(lensFilterIDs, forKey: EditKey("lensFilterIDs"))
+        try c.encode(lensFilterMetering.rawValue, forKey: EditKey("lensFilterMetering"))
+    }
+}

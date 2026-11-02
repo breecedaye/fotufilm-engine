@@ -1,0 +1,22 @@
+{
+  "name": "fotufilm-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "test": "node --test test/editor/*.test.js",
+    "test:browser": "playwright test",
+    "check:engine": "python3 ../tools/export-web-constants.py --check",
+    "check:video": "python3 ../tools/export-web-video.py --check"
+  },
+  "dependencies": {
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "@hevcjs/core": "1.4.5",
+    "mediabunny": "1.56.1",
+    "three": "0.186.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "vite": "^8.2.2"
+  }
+}

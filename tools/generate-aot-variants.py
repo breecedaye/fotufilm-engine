@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+
+import json
+from pathlib import Path
+import re
+import sys
+import textwrap
+
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA = ROOT / "Sources/FotufilmHalide/aot-variants.json"
+FRAME_HEADER = ROOT / "Sources/FotufilmHalide/include/FotufilmHalide.h"
+HEADER = ROOT / "Sources/FotufilmHalide/include/FotufilmAotVariants.h"
+SHIM_INCLUDES = ROOT / "Sources/FotufilmHalide/FotufilmHalideIOSVariants.h"
+PREFIX = "fotufilm_halide_ios_"
+TOKEN = re.compile(r"\b[A-Z][A-Z0-9_]*\b")
+
+
+def frame_bits():
+    bits = {}
+    for name, shift in re.findall(r"FOTUFILM_FRAME_(\w+) = 1 << (\d+)", FRAME_HEADER.read_text()):
+        bits[name] = 1 << int(shift)
+    if not bits:
+        raise ValueError("No FOTUFILM_FRAME_ bits found in " + str(FRAME_HEADER))
+    return bits
+
+
+class Table:
+    def __init__(self, schema):
+        self.schema = schema
+        self.bits = frame_bits()
+        self.spans = {}
+        for span in schema["spans"]:
+            self.spans[span["name"]] = self.evaluate(span["mask"])
+        self.variants = [(v["name"], self.evaluate(v["mask"]), v["mask"])
+                         for v in schema["variants"]]
+        self.windowed = [(v["name"], self.evaluate(v["mask"]), v["mask"])
+                         for v in schema["windowed"]["variants"]]
+        names = [name for name, _, _ in self.variants]
+        if len(set(names)) != len(names):
+            raise ValueError("Duplicate variant names: "
+                             + ", ".join(sorted(n for n in names if names.count(n) > 1)))
+        for name, _, _ in self.windowed:
+            if name not in names:
+                raise ValueError(f"Windowed twin {name} has no full-frame variant")
+        self.stage_bits = sum(self.resolve(t) for t in schema["axes"]["stage"])
+        self.exact_bits = sum(self.resolve(t) for t in schema["axes"]["exact"])
+        if self.stage_bits & self.exact_bits:
+            raise ValueError("A bit cannot be both coverable and exact")
+        twins = {name: mask for name, mask, _ in self.windowed}
+        self.exact_windowed = []
+        for twin in schema["windowed"].get("exact", []):
+            if twin["variant"] not in twins:
+                raise ValueError(f"Exact twin {twin['name']} has no windowed twin {twin['variant']}")
+            stages = self.evaluate(twin["stages"])
+            if stages & ~self.stage_bits:
+                raise ValueError(f"Exact twin {twin['name']} names bits that are not stages")
+            if stages & ~twins[twin["variant"]]:
+                raise ValueError(f"Exact twin {twin['name']} carries a stage its windowed twin "
+                                 "cannot bound")
+            self.exact_windowed.append(
+                (twin["variant"], twin["name"], (twins[twin["variant"]] & ~self.stage_bits) | stages,
+                 twin["stages"]))
+        exact_names = [f"{variant}_windowed_{name}" for variant, name, _, _ in self.exact_windowed]
+        if len(set(exact_names)) != len(exact_names):
+            raise ValueError("Duplicate exact twin names")
+
+    def resolve(self, token):
+        if token in self.spans:
+            return self.spans[token]
+        if token in self.bits:
+            return self.bits[token]
+        raise ValueError(f"Unknown span or FOTUFILM_FRAME_ bit: {token}")
+
+    def evaluate(self, expression):
+        names = {token: self.resolve(token) for token in set(TOKEN.findall(expression))}
+        return int(eval(expression, {"__builtins__": {}}, names)) & 0x7fffffff  # noqa: S307
+
+    def c_expression(self, expression):
+        def qualify(match):
+            token = match.group(0)
+            if token.startswith("FOTUFILM_"):
+                return token
+            return ("FOTUFILM_AOT_" if token in self.spans else "FOTUFILM_FRAME_") + token
+        return TOKEN.sub(qualify, expression)
+
+    def archives(self, windowed=True):
+        names = [name for name, _, _ in self.variants]
+        if windowed:
+            names += [name + "_windowed" for name, _, _ in self.windowed]
+            names += [f"{variant}_windowed_{name}" for variant, name, _, _ in self.exact_windowed]
+        names += self.schema["extras"]["names"]
+        return [PREFIX + name for name in names]
+
+    def describe(self, mask):
+        on = [name for name, bit in sorted(self.bits.items(), key=lambda kv: kv[1]) if mask & bit]
+        stage = [n for n in on if self.bits[n] & self.stage_bits]
+        exact = [n for n in on if self.bits[n] & self.exact_bits]
+        other = [n for n in on if not self.bits[n] & (self.stage_bits | self.exact_bits)]
+        return stage, exact, other
+
+
+def block_comment(text, indent):
+    if not text:
+        return []
+    lines = textwrap.wrap(text, width=94 - len(indent))
+    return [f"{indent}/* {lines[0]}"] + [f"{indent}   {line}" for line in lines[1:]]
+
+
+def doc_comment(text, indent=""):
+    return [f"{indent}/// {line}" for line in textwrap.wrap(text, width=96 - len(indent))]
+
+
+def macro_lines(lines):
+    return [line + " \\" for line in lines]
+
+
+def render_header(table):
+    schema = table.schema
+    out = [
+        "// Generated by tools/generate-aot-variants.py from Sources/FotufilmHalide/aot-variants.json.",
+        "#ifndef FOTUFILM_AOT_VARIANTS_H",
+        "#define FOTUFILM_AOT_VARIANTS_H",
+        "",
+    ]
+    for span in schema["spans"]:
+        out += doc_comment(span.get("doc", ""))
+        out.append(f"#define FOTUFILM_AOT_{span['name']} ({table.c_expression(span['mask'])})")
+        out.append("")
+
+    def entries(variants):
+        lines = []
+        for variant in variants:
+            lines += block_comment(variant.get("doc", ""), "    ")
+            if variant.get("doc"):
+                lines[-1] += " */"
+            lines.append(f"    X({variant['name']}, {table.c_expression(variant['mask'])})")
+        return lines
+
+    out.append("#define FOTUFILM_AOT_VARIANTS(X) \\")
+    variants = entries(schema["variants"])
+    out += macro_lines(variants[:-1]) + [variants[-1]]
+    out.append("")
+    out += doc_comment(schema["windowed"].get("doc", ""))
+    out.append("#define FOTUFILM_AOT_WINDOWED_VARIANTS(X) \\")
+    windowed = entries(schema["windowed"]["variants"])
+    out += macro_lines(windowed[:-1]) + [windowed[-1]]
+    out.append("")
+    if table.exact_windowed:
+        out += doc_comment(schema["windowed"].get("exact_doc", ""))
+        out.append("#define FOTUFILM_AOT_EXACT_WINDOWED_VARIANTS(X) \\")
+        windowed_masks = {v["name"]: v["mask"] for v in schema["windowed"]["variants"]}
+        exact = [
+            f"    X({variant}, {name}, "
+            f"((({table.c_expression(windowed_masks[variant])}) & ~FOTUFILM_VARIANT_STAGE_BITS) "
+            f"| {table.c_expression(stages)}))"
+            for variant, name, _, stages in table.exact_windowed]
+        out += macro_lines(exact[:-1]) + [exact[-1]]
+        out.append("")
+    out += doc_comment(schema["axes"].get("doc", ""))
+    out.append("#define FOTUFILM_VARIANT_STAGE_BITS \\")
+    out.append("    (" + " | ".join(
+        table.c_expression(t) for t in schema["axes"]["stage"]) + ")")
+    out.append("#define FOTUFILM_VARIANT_EXACT_BITS \\")
+    out.append("    (" + " | ".join(
+        table.c_expression(t) for t in schema["axes"]["exact"]) + ")")
+    out.append("#define FOTUFILM_AOT_VARIANT_BITS "
+               "(FOTUFILM_VARIANT_STAGE_BITS | FOTUFILM_VARIANT_EXACT_BITS)")
+    out += ["", "#endif", ""]
+    return "\n".join(out)
+
+
+def render_shim_includes(table):
+    schema = table.schema
+    out = [
+        "// Generated by tools/generate-aot-variants.py from Sources/FotufilmHalide/aot-variants.json.",
+        "#ifndef FOTUFILM_HALIDE_IOS_VARIANTS_H",
+        "#define FOTUFILM_HALIDE_IOS_VARIANTS_H",
+        "",
+    ]
+    for name, _, _ in table.variants:
+        out.append(f'#include "{PREFIX}{name}.h"')
+    out.append("")
+    if schema["extras"].get("doc"):
+        out.append("// " + schema["extras"]["doc"])
+    for name in schema["extras"]["names"]:
+        out.append(f'#include "{PREFIX}{name}.h"')
+    out.append("")
+    out.append("#if FOTUFILM_AOT_WINDOWED_HOST")
+    for name, _, _ in table.windowed:
+        out.append(f'#include "{PREFIX}{name}_windowed.h"')
+    for variant, name, _, _ in table.exact_windowed:
+        out.append(f'#include "{PREFIX}{variant}_windowed_{name}.h"')
+    out += ["#endif", "", "#endif", ""]
+    return "\n".join(out)
+
+
+def check_consumer(table, project, windowed=False):
+    text = Path(project).read_text()
+    missing = []
+    for archive in table.archives(windowed):
+        if len(re.findall(r"\b" + re.escape(archive) + r"\.a\b", text)) < 2:
+            missing.append(archive)
+    return missing
+
+
+def main(argv):
+    schema = json.loads(SCHEMA.read_text())
+    table = Table(schema)
+    header = render_header(table)
+    includes = render_shim_includes(table)
+    windowed = "--windowed" in argv
+    if "--archives" in argv:
+        print("\n".join(table.archives(windowed)))
+        return
+    if "--describe" in argv:
+        for name, mask, _ in table.variants:
+            stage, exact, other = table.describe(mask)
+            print(f"{name:52s} 0x{mask:08x}  stages[{' '.join(stage)}]  exact[{' '.join(exact)}]"
+                  + (f"  other[{' '.join(other)}]" if other else ""))
+        return
+    if "--check-consumer" in argv:
+        project = argv[argv.index("--check-consumer") + 1]
+        missing = check_consumer(table, project, windowed)
+        if missing:
+            sys.exit(f"{project} does not link every generated archive (needs each name twice):\n  "
+                     + "\n  ".join(missing))
+        print(f"{project}: all {len(table.archives(windowed))} archives linked")
+        return
+    if "--check" in argv:
+        stale = [str(path.relative_to(ROOT)) for path, content in
+                 ((HEADER, header), (SHIM_INCLUDES, includes))
+                 if not path.exists() or path.read_text() != content]
+        if stale:
+            sys.exit("Stale: " + ", ".join(stale) + ". Run python3 tools/generate-aot-variants.py.")
+        print(f"aot-variants: {len(table.variants)} variants, {len(table.archives())} archives, "
+              "outputs current")
+        return
+    HEADER.write_text(header)
+    SHIM_INCLUDES.write_text(includes)
+    print(f"aot-variants: wrote {HEADER.relative_to(ROOT)} and {SHIM_INCLUDES.relative_to(ROOT)} "
+          f"({len(table.variants)} variants, {len(table.archives())} archives)")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

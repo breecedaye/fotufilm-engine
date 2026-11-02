@@ -1,0 +1,185 @@
+// swift-tools-version: 5.9
+import Foundation
+import PackageDescription
+
+// Halide is an optional build-time dependency. Homebrew installs it into one of the first two
+// roots; HALIDE_ROOT also supports source/binary releases and Linux CI images.
+let halideRoots = [
+    ProcessInfo.processInfo.environment["HALIDE_ROOT"],
+    "/opt/homebrew",
+    "/usr/local",
+].compactMap { $0 }
+
+let halideDisabled = ProcessInfo.processInfo.environment["FOTUFILM_DISABLE_HALIDE"] == "1"
+let halideRoot = halideDisabled ? nil : halideRoots.first {
+    FileManager.default.fileExists(atPath: "\($0)/include/Halide.h")
+        && (FileManager.default.fileExists(atPath: "\($0)/lib/libHalide.dylib")
+            || FileManager.default.fileExists(atPath: "\($0)/lib/libHalide.so"))
+}
+
+let halidePlatforms: [Platform] = [.macOS, .linux]
+let halideCXXSettings: [CXXSetting] = halideRoot.map { root in
+    [
+        .define("FOTUFILM_HALIDE_ENABLED", .when(platforms: halidePlatforms)),
+        .define("FOTUFILM_ENABLE_COMPILED_CACHE", .when(platforms: [.macOS])),
+        .unsafeFlags(["-I\(root)/include", "-std=c++17"], .when(platforms: halidePlatforms)),
+    ]
+} ?? []
+let halideLinkerSettings: [LinkerSetting] = halideRoot.map { root in
+    [
+        // Resolve relocatable Halide libraries as well as Homebrew installations.
+        .unsafeFlags(
+            ["-L\(root)/lib", "-Xlinker", "-rpath", "-Xlinker", "\(root)/lib"],
+            .when(platforms: halidePlatforms)),
+        .linkedLibrary("Halide", .when(platforms: halidePlatforms)),
+        .linkedFramework("Metal", .when(platforms: [.macOS])),
+        .linkedFramework("Accelerate", .when(platforms: [.macOS])),
+        .linkedLibrary("dl", .when(platforms: [.linux])),
+        .linkedLibrary("pthread", .when(platforms: [.linux])),
+    ]
+} ?? []
+
+#if os(Linux)
+// CUDA benchmarking requires Halide. Objective-C++ Metal kernels require Apple frameworks.
+let benchmarkTargets: [Target] = halideRoot != nil ? [
+    .executableTarget(name: "fotufilmbench",
+                      dependencies: ["FotufilmCore", "FotufilmHalide"]),
+] : []
+let benchmarkProducts: [Product] = halideRoot != nil ? [
+    .executable(name: "fotufilmbench", targets: ["fotufilmbench"]),
+] : []
+let halideGPUCXXSettings: [CXXSetting] = halideRoot != nil
+    ? [.define("FOTUFILM_HALIDE_CUDA", .when(platforms: [.linux]))]
+    : []
+
+// SwiftPM builds every test file before applying filters; exclude Apple-only fixtures on Linux.
+let appleOnlyTests = [
+    // Unguarded CoreGraphics/CoreImage/ImageIO: these seven reach Apple's frameworks directly.
+    "RGBAImage.swift",
+    "GamutShowcaseTool.swift",
+    "LensCorpusHarness.swift",
+    "LensCorrectionFilterTests.swift",
+    "UnitCropCoordinatesTests.swift",
+    "GrainABTool.swift",
+    "NegativeScanFramingTests.swift",
+    // Image comparisons use ImageIO through RGBAImage.
+    "PrintDifference.swift",
+    "CatalogueStocks.swift",
+    "ReferenceChart.swift",
+    "ImageInstrumentTests.swift",
+    "SelfRetentionMeasurement.swift",
+    "SpectrumSceneTests.swift",
+]
+#else
+let benchmarkTargets: [Target] = []
+let benchmarkProducts: [Product] = []
+let halideGPUCXXSettings: [CXXSetting] = []
+let appleOnlyTests: [String] = []
+#endif
+
+let package = Package(
+    name: "Fotufilm",
+    platforms: [.macOS(.v13), .iOS(.v17)],
+    products: [
+        .library(name: "FotufilmCore", targets: ["FotufilmCore"]),
+        .library(name: "FotufilmUpdate", targets: ["FotufilmUpdate"]),
+        .library(name: "FotufilmMetal", targets: ["FotufilmMetal"]),
+        .library(name: "FotufilmImaging", targets: ["FotufilmImaging"]),
+        .library(name: "FotufilmStockMatch", targets: ["FotufilmStockMatch"]),
+        .library(name: "FotufilmEditModel", targets: ["FotufilmEditModel"]),
+        // The engine behind `fotufilm.h`, for hosts in other languages.
+        .library(name: "FotufilmHost", type: .dynamic, targets: ["FotufilmHost"]),
+        .executable(name: "fotufilm", targets: ["fotufilm"]),
+        .executable(name: "fotufilm-controls", targets: ["fotufilm-controls"]),
+        .executable(name: "fotufilm-web-profile", targets: ["fotufilm-web-profile"]),
+        .executable(name: "fotufilm-parity", targets: ["fotufilm-parity"]),
+    ] + benchmarkProducts,
+    targets: [
+        .target(name: "FotufilmUpdate"),
+        .target(
+            name: "FotufilmHalide",
+            path: "Sources/FotufilmHalide",
+            publicHeadersPath: "include",
+            cxxSettings: halideCXXSettings + halideGPUCXXSettings,
+            linkerSettings: halideLinkerSettings
+        ),
+        .target(
+            name: "FotufilmCore",
+            dependencies: ["FotufilmHalide"],
+            // Process camera profiles individually so dependency directory links are
+            // dereferenced into self-contained resources. Stocks retain their pack directory.
+            resources: [.process("Resources"),
+                        .process("CameraProfiles"),
+                        .copy("Stocks")]
+        ),
+        .target(
+            name: "FotufilmMetal",
+            dependencies: ["FotufilmCore", "FotufilmHalide"]
+        ),
+        // Core Image decoding and resampling shared by both apps and the CLI.
+        .target(name: "FotufilmImaging", dependencies: ["FotufilmCore"]),
+        // Choosing the film a photograph opens on.
+        .target(name: "FotufilmStockMatch", dependencies: ["FotufilmCore"]),
+        // Shared editor controls and their engine options.
+        .target(name: "FotufilmEditModel", dependencies: ["FotufilmCore"]),
+        // Installing the Resolve and Final Cut plug-ins, shared by the Mac app and Fotufilm Desktop.
+        .target(name: "FotufilmPlugins"),
+        .target(name: "CFotufilmHost"),
+        // Still images where there is no ImageIO (Linux), through the system's libraries.
+        .systemLibrary(name: "COpenEXR", pkgConfig: "OpenEXR",
+                       providers: [.apt(["libopenexr-dev"])]),
+        .target(name: "CFotufilmCodecs",
+                dependencies: [.target(name: "COpenEXR", condition: .when(platforms: [.linux]))],
+                cxxSettings: [.unsafeFlags(["-std=c++17"])],
+                linkerSettings: ["raw_r", "lcms2", "jpeg", "png", "tiff", "heif"].map {
+                    .linkedLibrary($0, .when(platforms: [.linux]))
+                }),
+        // Movies where there is no AVFoundation (Linux), through the system's FFmpeg, loaded
+        // when first asked for.
+        .target(name: "CFotufilmVideo",
+                cxxSettings: [.unsafeFlags(["-std=c++17"])],
+                linkerSettings: [.linkedLibrary("dl", .when(platforms: [.linux]))]),
+        .target(name: "FotufilmHost",
+                dependencies: ["CFotufilmHost", "FotufilmCore", "FotufilmImaging",
+                               "FotufilmEditModel", "FotufilmStockMatch", "FotufilmPlugins",
+                               "FotufilmUpdate",
+                               .target(name: "FotufilmMetal",
+                                       condition: .when(platforms: [.macOS, .iOS])),
+                               // Linux develops through the graph's CUDA and Vulkan entry points.
+                               .target(name: "FotufilmHalide",
+                                       condition: .when(platforms: [.linux])),
+                               .target(name: "CFotufilmCodecs",
+                                       condition: .when(platforms: [.linux])),
+                               .target(name: "CFotufilmVideo",
+                                       condition: .when(platforms: [.linux]))]),
+        .executableTarget(name: "fotufilm",
+                          dependencies: ["FotufilmCore", "FotufilmImaging", "FotufilmEditModel"]),
+        .executableTarget(name: "fotufilm-controls", dependencies: ["FotufilmEditModel"]),
+        .executableTarget(name: "fotufilm-web-profile", dependencies: ["FotufilmEditModel"]),
+        // Develops one scene on the CPU and the GPU (Metal, CUDA or Vulkan) for cross-machine parity.
+        .executableTarget(name: "fotufilm-parity",
+                          dependencies: ["FotufilmCore", "FotufilmHalide",
+                                         .target(name: "FotufilmImaging",
+                                                 condition: .when(platforms: [.macOS]))]),
+        .testTarget(
+            name: "FotufilmCoreTests",
+            dependencies: ["FotufilmCore",
+                           .target(name: "FotufilmMetal",
+                                   condition: .when(platforms: [.macOS, .iOS])),
+                           "FotufilmImaging", "FotufilmStockMatch"],
+            exclude: appleOnlyTests
+        ),
+        .testTarget(
+            name: "FotufilmEditModelTests",
+            dependencies: ["FotufilmEditModel", "FotufilmCore"]
+        ),
+        .testTarget(
+            name: "FotufilmHostTests",
+            dependencies: ["FotufilmHost", "CFotufilmHost", "FotufilmPlugins"]
+        ),
+        .testTarget(
+            name: "FotufilmUpdateTests",
+            dependencies: ["FotufilmUpdate"]
+        ),
+    ] + benchmarkTargets
+)

@@ -1,3 +1,350 @@
-# fotufilm-engine
+# Fotufilm engine
 
-Android APK build for the Fotufilm film simulation engine (upstream: DhaliwalX/fotufilm-engine, Apache-2.0). CI: .github/workflows/android-apk.yml
+Fotufilm is an open-source film simulation engine for photos and video. It models
+how light exposes photographic film, how the image develops into dye or silver,
+and how that film becomes a print, scan, or viewed transparency. Colour, contrast,
+grain, and halation follow the selected film's properties and the process used
+to render it.
+
+This repository includes the shared engine, a command-line tool, a Mac app,
+plugins for DaVinci Resolve and Final Cut Pro, and a browser photo and video editor.
+
+[Download for Mac](https://github.com/DhaliwalX/fotufilm-engine/releases/latest/download/Fotufilm-macOS.pkg) · [User guide](docs/documentation.html) · [![Download on the App Store](docs/assets/download-on-the-app-store.svg)](https://apps.apple.com/app/id6792911908)
+
+## How the film model works
+
+The model follows the stages between scene light and a finished photograph:
+
+```mermaid
+flowchart LR
+    A[Scene light] --> B[Film exposure]
+    B --> C[Development and grain]
+    C --> D[Print, scan, or direct view]
+    D --> E[Output image]
+```
+
+1. **Prepare the light.** The input is decoded into linear, wide-gamut RGB
+   (Rec.2020), where pixel values represent light. Exposure and colour adjustments
+   act here, before the film responds. Adding one stop of exposure doubles the
+   light sent into the model.
+2. **Expose the film.** The spectral model estimates a spectrum from RGB and
+   evaluates the film's sensitivity at 81 wavelengths, from 380 to 780 nm in
+   5 nm steps. Each layer records light according to its sensitivity. Emulsion
+   diffusion spreads detail, while **halation** models light returning through
+   the film base and exposing nearby areas, producing halos around bright sources.
+3. **Develop the image.** Each layer's characteristic curve maps exposure to
+   optical density: how much light the developed film blocks. The curve shapes
+   shadow response, midtone contrast, and highlights. Where the stock supports
+   them, interactions between developing layers and neighbouring areas also
+   shape colour separation and edge contrast.
+4. **Form the grain.** Grain varies the developed density according to the
+   stock's granularity and density response. Grain size and spatial effects are
+   expressed in physical film dimensions, then scaled to the image using the
+   selected film format and frame coverage.
+5. **View the result.** The output stage models how light passes through the
+   developed film. A print medium adds its own spectral response and development
+   curves; scan modes convert the negative to a positive. Reversal film produces
+   a positive for direct viewing or printing onto Ilfochrome/Cibachrome paper. The result is converted back to display colour.
+
+These stages explain why the controls work together: exposure moves the image
+along the film's response curve, film format changes the scale of its texture,
+and the output medium helps determine the final colour and contrast.
+
+**Source Illuminant** defaults to **Stock Native** for RAW, processed images and
+video. RAW white balance still controls decoding; it no longer automatically
+selects the simulated scene light. In the Mac app and plugins, choose a preset or
+**Custom** temperature to simulate another source, independently of print viewing light. In the CLI, use
+`--scene-kelvin 5500` for an explicit source; omission follows the selected stock.
+
+**Digital Reference** converts colour negatives with a shared spectral receiver and
+three **Screen Conversion** choices. **Reference Exposure** holds calibrated mid-grey
+and the film's contrast. **Graded Print** keeps film-base blacks and uses a gentler
+highlight curve. **Auto Levels** (default) re-times each frame the way a lab scanner
+does: it shifts the whole frame at the stock's own contrast until its bright regions sit
+near white, holding white two and a half to three and a half stops above the scene's median
+so a lamp clips and a fog is not stretched, and brightening a night or a stage by two and a
+half stops at most. It meters the frame before the Exposure control, so Exposure still acts,
+and on a colour negative re-times red and blue half way toward a neutral frame. It treats
+highlights and shadows alike: each negative gets the film exposure that places its mid-grey
+normally, and either end of a frame that reaches past the print, a sky past white or deep
+shade past black, is pulled back toward it by the same rule, the shadows most of the way so
+blacks stay rich. The other two move the colour records together to preserve colour
+differences between layers. The film base anchors display black. Below mid-grey, Auto
+Levels prints along a logarithmic curve in scene stops, so shadows darken gradually, keep
+their detail while the film records them, and ease onto black where it stops, with each
+record's toe balanced so dark greys stay neutral. These are idealized conversion models, not measured scanner profiles.
+Monochrome negatives take the same three choices on their own neutral curve. A
+transparent positive has no print curve to choose: Reference Exposure is the slide
+itself, mid-grey at 18% with the clear base above display white, while Graded Print
+brings the base to white and Auto Levels brings the frame's brightest content to
+white, the way a slide scanner normalises each frame.
+
+The output controls sit on top of the chosen style. **Paper Grade** (0–5, default 2) sets the
+contrast of the graded curve Graded Print and Auto Levels print a negative through, like a
+variable-contrast paper: softer grades roll highlights off earlier, harder grades later,
+while mid-grey and film-base black hold. **Screen Exposure** (±3 stops) lightens or
+darkens the conversion by the stated stops at mid-grey on any style — a negative's print
+exposure, a slide's scanner gain.
+
+On colour negatives, **Cyan / Red**, **Magenta / Green**, and **Yellow / Blue**
+adjust Digital Reference after Auto Levels and before the output curve. Positive
+values reduce red, green, or blue respectively; negative values do the reverse.
+Their -1 to +1 range uses relative correction units, not calibrated scanner steps.
+Equal positive values darken the result; use Screen Exposure to compensate if needed.
+Corrections can tint near-black tones or move channels into clipping. **Reset CMY**
+clears all three in the editors. Other output media, slides and monochrome ignore
+these settings. The CLI flags are `--screen-cyan`, `--screen-magenta`, and `--screen-yellow`.
+
+Choose a mode with `--paper screen --digital-reference reference-exposure|graded-print|auto-levels`,
+and add `--screen-grade 3` or `--screen-exposure -0.5` to it.
+The Mac editor saves the choice with each photograph. Auto Levels measures each frame;
+for consistent exposure across a video or a batch, use one of the fixed modes. Engine
+hosts can supply a temporally smoothed `sceneHighlightStops` measurement for video.
+
+## Profiles and model limits
+
+Film stocks are data-driven profiles describing spectral sensitivity,
+characteristic curves, dyes, grain, and spatial behaviour. The same engine reads
+these properties for colour negative, black-and-white, and reversal films. See
+[Included films](#included-films) and [Print media](#print-media) for the bundled
+data and its sources.
+
+Profiles can supply a separate wavelength-dependent minimum-density spectrum.
+The output model then adds absorption from dye formed above each record's minimum,
+so the film base and mask are counted once. A measured neutral spectrum constrains
+the combined absorption; it does not uniquely identify the individual dyes.
+
+The model combines published measurements with physical and statistical
+approximations. RGB cannot uniquely recover the original scene spectrum, and
+clipped highlights cannot supply missing exposure. Digitised curves are limited
+by their source graphs and extrapolate beyond the published range. Grain models
+describe aggregate texture rather than individual crystals. Results therefore
+depend on the input, profile data, and viewing conditions as well as the model.
+
+For a closer look at the implementation, start with the
+[pipeline and controls](Sources/FotufilmCore/Pipeline.swift),
+[spectral model](Sources/FotufilmCore/SpectralModel.swift), and
+[film profile structure](Sources/FotufilmCore/FilmStock.swift).
+
+## Build the engine
+
+On a Mac, install Xcode 26 or newer and Halide:
+
+```sh
+brew install halide
+swift build
+python3 tools/test-engine.py
+```
+
+The test command builds the release test bundle and runs every discovered test in
+up to eight persistent workers. It checks that each test ran exactly once and
+records worker logs and a timing report in `build/engine-tests`. Use
+`--workers 2` on a smaller machine. The previous report helps balance later runs;
+it never substitutes for running tests.
+
+On macOS, Swift package builds reuse compiled Halide CPU and Metal kernels across
+processes. The test command stores them in `.build/compiled-kernels`; other package
+clients use the macOS user cache directory. These files contain compiled code,
+not photos or rendered results. Engine binaries, Halide, compiler, SDK, target
+and compilation settings identify each cache entry, so first runs and runs after
+relinking can take longer. Missing or invalid entries are rebuilt; unavailable
+caches fall back to normal JIT compilation. Set `FOTUFILM_COMPILED_CACHE=0` to
+disable reuse, or remove
+`.build/compiled-kernels` to clear the test cache.
+
+The standard `swift test -c release --parallel` command remains supported for
+testing with SwiftPM's process scheduling.
+
+The engine test workflow runs on every pull request and push to main. Manual runs also
+check the desktop apps, plugins, AOT parity, and website.
+
+If Halide is installed elsewhere, set `HALIDE_ROOT` to its installation folder.
+
+### Apple AOT kernels
+
+Build kernels locally with `FOTUFILM_AOT_NO_FETCH=1 tools/generate-halide-aot.sh device`
+(or `simulator`, `macos`, `macos-intel`). Set `HALIDE_ROOT` to the compiler installation.
+Generated archives include licence notices and pass source, platform and file-hash checks.
+Use `tools/verify-aot-parity.sh` to compare the generated kernels with the reference path.
+
+The compiler contract is in `tools/aot-toolchain.json`; update it deliberately when
+upgrading the toolchain. Install `cmake`, `ninja`, `llvm@22`, `lld@22` and `flatbuffers`
+with Homebrew, set `LLVM_ROOT` and `LLD_ROOT` to those versioned formula prefixes,
+and build the compiler with `tools/build-halide.sh`.
+
+### Command-line use
+
+List the included films or process an image from the command line:
+
+```sh
+swift run fotufilm --list-stocks
+swift run fotufilm input.jpg output.jpg --stock gold200
+```
+
+## Build Fotufilm Desktop and plugins
+
+Fotufilm Desktop targets Apple silicon and macOS 14 or newer, and x86-64 Linux.
+
+```sh
+flutter/build.sh
+```
+
+Open `build/flutter-host/Fotufilm.app`. The build also includes the Resolve plugin.
+To include the Final Cut plugin, install Apple's FxPlug SDK first. See the
+[Resolve guide](resolve/README.md) and [Final Cut guide](finalcut/README.md)
+for separate builds and installation steps, and the [editor guide](flutter/README.md) for
+Linux.
+
+Desktop, Resolve, and Final Cut rebuilds reuse compiled objects after checking source
+and header contents, compiler, flags, and SDK dependencies. Linking, bundle assembly,
+signing, audits, and requested tests still run. Set `FOTUFILM_BUILD_CACHE=0` to
+force recompilation, or remove `build/engine/obj`, `build/resolve/obj-*`, and
+`build/finalcut/obj-*`.
+
+## Build the browser editor
+
+Install Emscripten and Python 3.10 or newer. Set `EMSDK_ROOT` to your Emscripten
+SDK folder, or install it at `build/emsdk`. Then run:
+
+```sh
+tools/build-wasm.sh
+(cd web && npm ci)
+cd flutter
+tool/build-web.sh --assets ../web/public
+```
+
+The output is in `flutter/build/web`. Set `FOTUFILM_BASE=/demo/` when running
+`tool/build-web.sh` to host the demo at [fotufilm.com/demo](https://fotufilm.com/demo/).
+Video supports the Mac app’s camera log inputs, frame previews, trimming, audio,
+and MP4 / H.264 or WebM / VP9 export. It reads files in bounded slices and streams
+exports to disk. HEVC Main / Main10 has a worker-based software decoder when
+native decoding cannot expose its original pixels. Export is 8-bit SDR.
+
+The editor previews adjustments automatically and
+exports from the original image, up to 120 megapixels. Large images render in
+tiles; the pack carries spatial parameters for a ladder of frame sizes so grain
+and halation follow the emulsion's scale. The editor uses the CPU when
+a WebGPU-compatible Halide toolchain is not available. To build one, install Homebrew's `llvm` and
+`lld` and run `tools/build-halide.sh --webgpu` first; it fetches the Halide
+pull request the browser runtime needs and applies the patches in `tools/`.
+
+The reference CPU kernels use strict float32 evaluation; production WebGPU uses
+hardware float32 arithmetic with image-quality checks against that reference.
+Rebuild an older WebGPU toolchain before generating the browser runtime; the build
+checks that its compiler and runtime patches match the engine. The
+[quality diagnostics](tools/webgpu-parity/README.md) compare linear output and
+8-bit/16-bit delivery, with explicit bit-parity probes for arithmetic diagnostics.
+
+The [browser editor guide](docs/documentation.html) covers controls, shortcuts,
+export, and the features that still require the Mac app.
+
+## Included films
+
+Default source builds include all 47 film profiles, free to use without activation.
+The runtime JSON profiles are available in `Sources/FotufilmCore/Stocks/` under
+[CC BY-SA 4.0](licenses/FILM-PROFILES.txt). You may modify and redistribute them
+with attribution and ShareAlike terms. This licence does not apply to rendered
+photos or videos. The engine code uses Apache-2.0.
+
+Thirty-three profiles carry sampled characteristic curves with smooth interpolation
+through every validated digitized point. Source tracing variations are retained;
+response outside each published range is extrapolated. These schema version 2
+profiles require a build with sampled-curve support. Schema version 1 remains supported.
+
+The CLI and tests also include synthetic films. The browser opens a generated scene-linear float32 EXR chart.
+See [Build support](docs/support.html) for stock-pack setup.
+
+## Print media
+
+The nine negative-to-positive physical media below are digitised from the manufacturers'
+published datasheets, on the same 380-780 nm grid at 5 nm the film model uses.
+Ilfochrome/Cibachrome adds two positive-to-positive papers with approximate profiles.
+
+| Medium | Source |
+| --- | --- |
+| Kodak Ektacolor Edge | Kodak E-7020 (April 2019) |
+| Kodak Professional Endura Premier | Kodak E-4070 (March 2013) |
+| Fujicolor Crystal Archive Type CA | Fujifilm AF3-0250U2 (November 2018) |
+| Kodak Vision 2383 | Kodak H-1-2383 (March 2022) |
+| Kodak Vision Premier 2393 | Kodak 2393 curve sheets |
+| Fujifilm ETERNA-CP 3513DI | Fujifilm ETERNA-CP 3513DI brochure |
+| Kodak EXR 5386 | Kodak H-1-5386 (February 1999) |
+| Agfa CP30 | Agfa CP30 Technical Data (October 2011) |
+| Fujifilm ETERNA-CP 3521XD | Fujifilm KB-0707E (November 2007), curves; 3513DI spectra |
+| Ilfochrome Classic CPS.1K (Cibachrome), normal contrast | Ilford TDS 307US (August 2003), tone specifications |
+| Ilfochrome Classic CLM.1K (Cibachrome), medium contrast | Ilford TDS 307US (August 2003), tone specifications |
+
+For slide film, choose Ilfochrome Classic CPS.1K or the softer CLM.1K in **Output Medium**.
+The CLI accepts `--paper ilfochrome-cps-1k` or `--paper ilfochrome-clm-1k`;
+`ilfochrome` and `cibachrome` both select CPS.1K. Match Film still defaults to direct viewing.
+Instant sheets remain direct-view only, and negative films retain their existing media.
+Positive paper supports viewing light and the simulated optical printer; increasing
+printer exposure lightens the print. Paper output is SDR.
+
+These profiles use the [Ilford Deluxe media datasheet](https://www.bonavolta.ch/hobby/files/Ilfochrome_CPS_CLM_E.pdf),
+p. 1: visual density ranges of 2.0/2.05 D and mid-tone contrasts of 1.40/1.15.
+The curves' endpoints are approximate. The publication does not supply spectral sensitivities
+or dye spectra; the current color model uses the Ektacolor receiver as a provisional basis.
+It does not reproduce measured Ilfochrome azo-dye color. Cibachrome aliases the same family;
+a separate historical coating is not simulated.
+
+A sheet that publishes one characteristic curve develops all three records along it;
+E-7020, E-4070, 2383, 2393, ETERNA-CP, 5386, CP30 and 3521XD publish three and are carried per
+record. The lab scan and
+telecine are inversions rather than sheets, and are described in `PrintPaperTables.swift`.
+Cineon Log is a scan with no inversion: printing density read through the SMPTE RP 180 bands
+under an equal-energy lamp, delivered as Cineon code values (0.002 D a code value) from a
+scanner set up on the stock's laboratory aim density, so a normally exposed grey reads 445 in
+every record. It is for grading, as DaVinci Resolve's Cineon Film Log and its
+2383 and 3513 print LUTs read it. Print timing, grade and finish do not apply to it. The CLI
+writes it as a 10-bit DPX (`fotufilm in.dng out.dpx --paper cineon-log`), and the editor's
+export offers DPX · Cineon 10-bit for it.
+Lab Scan produces an editable positive and sets up each frame the way a minilab scanner
+does: the film base scans black and the frame's brightest content near white, a backlit
+subject opens up partway while the sky stays on the curve's toe, and contrast rises, at most
+1.5 times the stock's, only as far as reaching both points needs. Red and blue are steepened
+only where their base would otherwise show the film's mask, so blacks stay neutral. Native photo export defaults to a lossless 16-bit Display P3 TIFF with its
+color profile. Telecine retains its finished Rec.709 transfer. Existing Lab Scan edits
+render differently with the new curve.
+
+Colour release prints time the reference negative to the published gross Status A
+LAD aims: 1.09/1.06/1.03 for Kodak 2383 and 2393, 1.10/1.06/1.03 for Kodak 5386,
+1.10/1.05/1.05 for both ETERNA-CP stocks, and 1.15/1.05/1.05 for Agfa CP30.
+The solve preserves relative layer speeds and changes exposure through a non-negative,
+UV-blocked tungsten RGB additive head. These aims are not three equal densities
+above clear film. Reflection papers retain a visually balanced 0.744 D (18%) setup
+under D50. Viewing another lamp never changes the developed dyes. Optional digital
+channel-contrast correction is off by default.
+
+Red, Green and Blue Light re-time a release print from that aim in printer points:
+25-25-25 is the aim, and each point scales its own beam by 0.025 log exposure, so more
+red light adds cyan and all three together make the print denser. The 1-50 range is the
+conventional printer scale.
+
+The printer passbands and filtered 5400 K xenon reference are explicit approximations,
+not measured printer filters or the manufacturers' original calibration lamps. Output
+is relative to clear medium; no unmeasured print-base spectrum is invented. Reflection
+paper filtration remains an exposure-ratio approximation. ETERNA-CP's published Gray
+and dye sum remain inconsistent with a non-negative additive base, so its neutral
+spectral calibration remains uncertain.
+
+
+`SOURCE_ASSETS.json` records where assets came from and their file hashes. Record the
+source and hash of new data and images there.
+
+To convert a scan, choose **File → Import Scanned Negative…**, sample its clear film
+border and preview the positive. Import it to adjust all four crop corners independently.
+See the [scan import guide](docs/scanned-negatives.md) for input requirements and
+the approximate conversion’s limits.
+
+## More information
+
+- [User guide](docs/documentation.html)
+- [Film grain](docs/film-grain.md)
+- [Renderer integration, buffer storage, and grain assets](docs/rendering-integration.md)
+- [Build support](docs/support.html)
+- [Licensing](LICENSING.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+The engine, Mac app, and plugins use [Apache-2.0](LICENSE). Film profiles and the
+editor glyphs have [separate licences](LICENSING.md).

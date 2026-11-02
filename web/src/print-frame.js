@@ -1,0 +1,156 @@
+import { editorControl } from "./editor-catalogue.js";
+import { PROFILE_MENUS } from "./generated/controls.js";
+
+export const frameChoices = () => editorControl("printFrame").choices;
+export function parsePrintFrame(value) {
+  if (value == null) return "none";
+  if (!frameChoices().some((choice) => choice.id === value))
+    throw new Error("Invalid print frame.");
+  return value;
+}
+// Border Width, a multiple of the frame's preset margin. Older edits have none and keep the preset.
+export function parsePrintFrameMargin(value) {
+  if (value == null) return 1;
+  const { min, max } = editorControl("printFrameMargin").scale;
+  if (!Number.isFinite(value) || value < min || value > max)
+    throw new Error("Invalid print frame border width.");
+  return value;
+}
+// A Film Border's frame number, 0 to 38 (Frame Number); older edits have none and show frame 1.
+export function parsePrintFrameNumber(value) {
+  if (value == null) return 1;
+  if (!editorControl("printFrameNumber").choices.some((c) => c.value === value))
+    throw new Error("Invalid film border frame number.");
+  return value;
+}
+// Whether a Film Border shows the stock's edge printing (Edge Printing); older edits show it.
+export function parsePrintFrameEdgePrinting(value) {
+  if (value == null) return true;
+  if (typeof value !== "boolean") throw new Error("Invalid film border edge printing.");
+  return value;
+}
+// Where a film border's aperture sits on a photograph of another shape, [across, down] from -1
+// to 1 (Framing); older edits have none and centre it.
+export function parsePrintFrameFraming(value) {
+  if (value == null) return [0, 0];
+  if (
+    !Array.isArray(value) ||
+    value.length !== 2 ||
+    !value.every((v) => Number.isFinite(v) && Math.abs(v) <= 1)
+  )
+    throw new Error("Invalid film border framing.");
+  return value;
+}
+// How many frames' length of the roll a Film Border's picture is exposed across (Frames); older
+// edits have one.
+export function parsePrintFrameCount(value) {
+  if (value == null) return 1;
+  if (!editorControl("printFrameCount").choices.some((c) => c.value === value))
+    throw new Error("Invalid film border frame count.");
+  return value;
+}
+// The camera a 135 Film Border's picture was exposed in (Camera); older edits have a 35mm or
+// panoramic camera's.
+export function parsePrintFrameCamera(value) {
+  if (value == null) return "panoramic";
+  if (!editorControl("printFrameCamera").choices.some((c) => c.id === value))
+    throw new Error("Invalid film border camera.");
+  return value;
+}
+export function frameRequest(edit, width = 1, height = 1) {
+  return {
+    kind: "print-frame",
+    stock: edit.stock,
+    frame: edit.printFrame || "none",
+    format: edit.format || null,
+    medium: edit.medium || null,
+    margin: edit.printFrameMargin ?? 1,
+    frameNumber: edit.printFrameNumber ?? 1,
+    edgePrinting: edit.printFrameEdgePrinting ?? true,
+    framing: edit.printFrameFraming ?? [0, 0],
+    frames: edit.printFrameCount ?? 1,
+    camera: edit.printFrameCamera ?? "panoramic",
+    viewingKelvin:
+      PROFILE_MENUS.printLight.find((c) => c.id === edit.profile?.printLight)
+        ?.value ?? null,
+    width,
+    height,
+  };
+}
+export function frameRenderEdit(edit, plan) {
+  if (!plan || plan.configuration.frame === "none") return edit;
+  const transparency = ["film", "slideMount"].includes(
+    plan.configuration.frame,
+  );
+  return {
+    ...edit,
+    medium: plan.renderMedium || edit.medium,
+    profile: {
+      ...edit.profile,
+      ...(transparency ? { printLight: "reference" } : {}),
+      ...(plan.renderMedium === "negative"
+        ? { negativeViewing: "light-box" }
+        : {}),
+    },
+  };
+}
+// Selection samples remain in photograph coordinates. A click in the surrounding material
+// does not pick a colour from the photo, even when the canvas is zoomed or rotated.
+export function frameSamplePoint(point, plan) {
+  if (!plan) return point;
+  const { size, image } = plan.placement;
+  const x = (point[0] * size.width - image.x) / image.width;
+  const y =
+    (point[1] * size.height - (size.height - image.y - image.height)) /
+    image.height;
+  if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) return null;
+  // On the whole photograph, of which a film border shows a part.
+  const crop = plan.cropFraction;
+  return crop ? [crop.x + x * crop.width, crop.y + y * crop.height] : [x, y];
+}
+// The part of a source a film border shows (`plan.crop`, from PrintFramePlacement.photoCrop), in
+// its pixels from the top left.
+export function cropSource(source, crop) {
+  return {
+    width: crop.width,
+    height: crop.height,
+    read: (x, y, w, h) => source.read(x + crop.x, y + crop.y, w, h),
+  };
+}
+// A Film Border develops its whole strip with the photograph (`plan.strip`, from
+// PrintFramePlacement.filmStrip): the photograph continued past its edges over the larger piece
+// of film, as UnexposedEdge.extend does natively. The gate the profile carries shades it there.
+export function stripSource(source, strip) {
+  const width = source.width + strip.left + strip.right,
+    height = source.height + strip.top + strip.bottom;
+  const clampX = (x) => Math.min(Math.max(x - strip.left, 0), source.width - 1),
+    clampY = (y) => Math.min(Math.max(y - strip.top, 0), source.height - 1);
+  return {
+    width,
+    height,
+    read(x, y, w, h) {
+      const x0 = clampX(x),
+        x1 = clampX(x + w - 1),
+        y0 = clampY(y),
+        y1 = clampY(y + h - 1);
+      const sw = x1 - x0 + 1;
+      const extend = (inner) => {
+        const out = new inner.constructor(w * h * 4);
+        for (let row = 0; row < h; row++) {
+          const from = (clampY(y + row) - y0) * sw * 4;
+          for (let column = 0; column < w; column++) {
+            const i = from + (clampX(x + column) - x0) * 4,
+              o = (row * w + column) * 4;
+            out[o] = inner[i];
+            out[o + 1] = inner[i + 1];
+            out[o + 2] = inner[i + 2];
+            out[o + 3] = inner[i + 3];
+          }
+        }
+        return out;
+      };
+      const inner = source.read(x0, y0, sw, y1 - y0 + 1);
+      return inner && typeof inner.then === "function" ? inner.then(extend) : extend(inner);
+    },
+  };
+}

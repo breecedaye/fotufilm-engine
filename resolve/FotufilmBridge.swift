@@ -1,0 +1,1104 @@
+import Foundation
+
+import FotufilmHalide
+
+private let cameraInputDecoders = EditorControlCatalogue.pluginCameraInputs.map {
+    CameraLogDecoder($0.encoding)
+}
+
+@_cdecl("fotufilm_bridge_camera_input_count")
+func fotufilm_bridge_camera_input_count() -> Int32 { Int32(cameraInputDecoders.count) }
+
+@_cdecl("fotufilm_bridge_camera_input_name")
+func fotufilm_bridge_camera_input_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                       _ capacity: Int32) -> Int32 {
+    guard cameraInputDecoders.indices.contains(Int(index)) else { return -1 }
+    return copyOut(EditorControlCatalogue.pluginCameraInputs[Int(index)].label, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_decode_camera")
+func fotufilm_bridge_decode_camera(_ index: Int32, _ input: UnsafePointer<Float>?,
+                                   _ output: UnsafeMutablePointer<Float>?, _ count: Int32,
+                                   _ premultiplied: Int32) -> Int32 {
+    guard cameraInputDecoders.indices.contains(Int(index)), count >= 0,
+          let input, let output else { return -1 }
+    return cameraInputDecoders[Int(index)].decodeRGBA(input, into: output, count: Int(count),
+                                                     premultiplied: premultiplied != 0) ? 1 : 0
+}
+
+/// Loading mutates the process-wide stock registry once. Rendering does not take this lock: each
+/// effect instance owns its mutable device arguments and LUT cache in the context below.
+private let initializationLock = NSLock()
+nonisolated(unsafe) private var initializationError = ""
+
+/// Stock ids in the engine's display order.
+nonisolated(unsafe) private var stockIDs: [String] = []
+
+/// Everything mutable that belongs to one OFX effect instance. The OFX instance-safe contract
+/// prevents two renders from entering the same context concurrently; the lock also keeps sequence
+/// warm-up and error reads from racing a render action.
+private final class BridgeContext {
+    let lock = NSLock()
+    let device: BridgeDevice
+    var lastError: String
+    var frameStaging: BridgeStaging?
+    var outputQuery: OutputTransformQuery?
+    let hostFrames = BridgeHostFrames()
+
+    init?(lastError: String) {
+        guard let device = BridgeDevice() else { return nil }
+        self.device = device
+        self.lastError = lastError
+    }
+
+    func releaseStaging() {
+        guard let staging = frameStaging else { return }
+        frameStaging = nil
+        BridgeRenderer.shared?.recycleFrameStaging(staging)
+    }
+
+    func withDevice<Result>(_ body: () -> Result) -> Result {
+        device.run(body)
+    }
+
+    deinit { releaseStaging() }
+}
+
+/// Cache key for output-variant availability. Seed and frame number are excluded because they do
+/// not affect the feature mask. Whether the frame is staged is part of it: a staged render may
+/// ask for the kernel that measures its own glare and a striped one never does.
+private struct OutputTransformQueryKey: Equatable {
+    let stock: Int32
+    let format: Int32
+    let paper: Int32
+    let width: Int32
+    let height: Int32
+    let interactive: Int32
+    let staged: Bool
+    let parameters: [Float]
+}
+
+private struct OutputTransformQuery {
+    let key: OutputTransformQueryKey
+    let answer: Int32
+}
+
+private func context(_ opaque: UnsafeMutableRawPointer?) -> BridgeContext? {
+    guard let opaque else { return nil }
+    return Unmanaged<BridgeContext>.fromOpaque(opaque).takeUnretainedValue()
+}
+
+private func currentInitializationError() -> String {
+    initializationLock.lock()
+    defer { initializationLock.unlock() }
+    return initializationError
+}
+
+/// The Resolve realtime schedule is the shipped default. Setting `FOTUFILM_REALTIME=0` before
+/// Resolve starts restores the reference decode, film arithmetic, glare measurement, and output
+/// encode for comparison without requiring a different plugin build.
+nonisolated(unsafe) private var realtimeRenderingEnabled = true
+
+private typealias Parameter = BridgeSlot
+
+/// The filter drawer, in the order a host's menu indexes it. The catalogue is the engine's, so
+/// the host's menu is the engine's list plus a "None" the plugin owns.
+private let lensFilters = LensFilter.catalogue
+
+/// How the exposure was set behind that glass, and the two halves of a diffusion filter, each in
+/// the enum's own `allCases` order.
+private let meterings = LensFilterCompensation.allCases
+private let diffusionFamilies = DiffusionFilter.Family.allCases
+private let diffusionGrades = DiffusionFilter.Grade.allCases
+
+/// The grade the engine's command line takes when none is named, published so the two sides
+/// cannot disagree about which entry a host should land its menu on.
+private let defaultDiffusionGrade = DiffusionFilter.Grade.quarter
+
+/// How a developed negative is read.
+private let negativeViewings = NegativeViewing.allCases
+
+/// The spans, in the order the host's menu indexes them.
+private let stages = PipelineStage.allCases
+
+/// The spatial stages the texture span can be asked for, in the order the host lists them.
+private let textureStages = TextureStages.ordered
+
+/// Copies `value` into the caller's buffer as a NUL-terminated C string,
+/// returning the length written.
+private func copyOut(_ value: String, _ out: UnsafeMutablePointer<CChar>?,
+                     _ capacity: Int32) -> Int32 {
+    guard let out, capacity > 0 else { return -1 }
+    let bytes = Array(value.utf8)
+    guard bytes.count + 1 <= Int(capacity) else { return -1 }
+    for (i, byte) in bytes.enumerated() { out[i] = CChar(bitPattern: byte) }
+    out[bytes.count] = 0
+    return Int32(bytes.count)
+}
+
+/// The output media the host can choose between, in a fixed order the host's choice indexes into.
+private let papers = PrintPaper.allCases
+
+/// A float slot read as the small non-negative integer it is carrying. Saturating rather than
+/// trapping: the host's parameter array is checked for finiteness on its own side, and a bridge
+/// that crashed the host over a bad float would be the worse failure.
+private func whole(_ value: Float) -> Int32 {
+    guard value.isFinite, value > 0 else { return 0 }
+    return Int32(min(value, Float(Int16.max)))
+}
+
+/// The span the parameter array names, or nil when it names one this build does not have.
+///
+/// Returns nil for unsupported spans. Falling back to `full` could cause a developed negative to
+/// be printed twice by the node graph.
+private func stage(of parameters: UnsafePointer<Float>?) -> PipelineStage? {
+    guard let parameters else { return .full }
+    return PipelineStage(ordinal: whole(parameters[Parameter.stage]))
+}
+
+private func options(_ parameters: UnsafePointer<Float>?,
+                     format: Int32, stockIndex: Int32, paper: Int32,
+                     seed: UInt32) -> FotufilmEngine.Options {
+    var result = FotufilmEngine.Options()
+    if papers.indices.contains(Int(paper)) {
+        result.paper = papers[Int(paper)]
+    }
+    guard let parameters else { return result }
+    func value(_ index: Int) -> Float { parameters[index] }
+
+    BridgeOptions.apply(parameters, to: &result)
+    if let chosen = stage(of: parameters) { result.stage = chosen }
+    result.textureStages = TextureStages(
+        rawValue: whole(value(Parameter.textureStages)) & TextureStages.all.rawValue)
+    let coating: FilterCoating = value(Parameter.filterCoating) == 1 ? .singleLayer
+        : (value(Parameter.filterCoating) == 2 ? .uncoated : .multiCoated)
+    var fitted: [LensFilter] = []
+    for slot in [Parameter.lensFilter1, Parameter.lensFilter2, Parameter.lensFilter3] {
+        let choice = Int(whole(value(slot))) - 1
+        guard lensFilters.indices.contains(choice) else { continue }
+        var filter = lensFilters[choice]
+        filter.coating = coating
+        fitted.append(filter)
+    }
+    if !fitted.isEmpty {
+        let choice = Int(whole(value(Parameter.lensMetering))) - 1
+        result.lensFilters = LensFilterStack(
+            fitted,
+            compensation: meterings.indices.contains(choice) ? meterings[choice] : .throughTheLens)
+    }
+    let family = Int(whole(value(Parameter.diffusionFamily))) - 1
+    if diffusionFamilies.indices.contains(family) {
+        let grade = Int(whole(value(Parameter.diffusionGrade)))
+        result.diffusionFilter = DiffusionFilter.preset(
+            diffusionFamilies[family],
+            grade: diffusionGrades.indices.contains(grade)
+                ? diffusionGrades[grade] : defaultDiffusionGrade,
+            coating: coating)
+    }
+    if value(Parameter.mottleOverride) != 0 {
+        result.grainMottleShare = clamp(value(Parameter.mottleShare), 0, 0.9)
+        result.completeDeliveryMottle()
+    } else {
+        result.grainMottleShare = nil
+    }
+    result.couplerRangeScale = clamp(1 + value(Parameter.couplerReach), 0, 3)
+    if value(Parameter.couplerRedGreen) != 0 || value(Parameter.couplerGreenBlue) != 0 {
+        result.couplerGapReachScales = [Parameter.couplerRedGreen, Parameter.couplerGreenBlue]
+            .map { clamp(1 + value($0), 0, 3) * result.couplerRangeScale }
+    } else {
+        result.couplerGapReachScales = nil
+    }
+    let sceneLight = value(Parameter.sceneIlluminant)
+    if sceneLight > 0 { result.sceneIlluminantKelvin = sceneLight }
+    let viewing = Int(whole(value(Parameter.negativeViewing))) - 1
+    if result.paper?.isNegative == true, negativeViewings.indices.contains(viewing) {
+        result.negativeViewing = negativeViewings[viewing]
+    } else {
+        result.negativeViewing = nil
+    }
+
+    let formats = FilmFormat.presets
+    if formats.indices.contains(Int(format)) {
+        result.format = formats[Int(format)].format
+    } else if stockIDs.indices.contains(Int(stockIndex)) {
+        result.format = FilmFormat.native(forStockID: stockIDs[Int(stockIndex)])
+    }
+    result.seed = UInt64(seed)
+    return result
+}
+
+/// `struct FotufilmOutputTransform` as this side sees it: two int32 fields — transfer shape and
+/// premultiplication — then a row-major 3x3, six transfer coefficients, and three gamut
+/// luminance weights, tightly packed.
+/// Spelled out field by field because this side of the bridge does not see the plugin's C
+/// header, so the two declarations have to be kept beside each other.
+private enum OutputTransformField {
+    static let transfer = 0
+    static let premultiplied = 1
+    static let matrix = 0
+    static let coefficients = 9
+    static let gamutLuminance = 15
+    static let firstFloat = 2 * MemoryLayout<Int32>.size
+}
+
+/// `struct FotufilmInputTransform` as this side sees it: the output layout without gamut
+/// weights. This side does not see the plugin's C header.
+private enum InputTransformField {
+    static let transfer = 0
+    static let premultiplied = 1
+    static let matrix = 0
+    static let coefficients = 9
+    static let firstFloat = 2 * MemoryLayout<Int32>.size
+}
+
+private func inputTransform(_ pointer: UnsafeRawPointer?) -> FilmInputTransform? {
+    guard let pointer else { return nil }
+    let flags = pointer.assumingMemoryBound(to: Int32.self)
+    let floats = (pointer + InputTransformField.firstFloat)
+        .assumingMemoryBound(to: Float.self)
+    guard let transfer = FilmInputTransform.Transfer(
+        rawValue: flags[InputTransformField.transfer]) else { return nil }
+    let matrix = InputTransformField.matrix
+    let coefficients = InputTransformField.coefficients
+    return FilmInputTransform(
+        matrix: (matrix..<(matrix + 9)).map { floats[$0] },
+        transfer: transfer,
+        coefficients: (coefficients..<(coefficients + 6)).map { floats[$0] },
+        premultiplied: flags[InputTransformField.premultiplied] != 0)
+}
+
+private func outputTransform(_ pointer: UnsafeRawPointer?) -> FilmOutputTransform? {
+    guard let pointer else { return nil }
+    let flags = pointer.assumingMemoryBound(to: Int32.self)
+    let floats = (pointer + OutputTransformField.firstFloat)
+        .assumingMemoryBound(to: Float.self)
+    guard let transfer = FilmOutputTransform.Transfer(
+        rawValue: flags[OutputTransformField.transfer]) else { return nil }
+    let matrix = OutputTransformField.matrix
+    let coefficients = OutputTransformField.coefficients
+    let gamut = OutputTransformField.gamutLuminance
+    let luminance = SIMD3(floats[gamut], floats[gamut + 1], floats[gamut + 2])
+    return FilmOutputTransform(
+        matrix: (matrix..<(matrix + 9)).map { floats[$0] },
+        transfer: transfer,
+        coefficients: (coefficients..<(coefficients + 6)).map { floats[$0] },
+        premultiplied: flags[OutputTransformField.premultiplied] != 0,
+        gamutLuminance: luminance == .zero ? nil : luminance)
+}
+
+/// The stock an index names, or nil when the pack has changed under the host.
+private func stock(at index: Int32) -> FilmStock? {
+    guard stockIDs.indices.contains(Int(index)) else { return nil }
+    return FilmStock.named(stockIDs[Int(index)])
+}
+
+private func validateDevelopment(_ settings: FotufilmEngine.Options,
+                                 stock: FilmStock, context: BridgeContext) -> Bool {
+    if settings.transportConstruction(for: stock) != nil && !stock.donorLayers.isEmpty {
+        context.lastError = "Layered Transport does not yet support donor-layer stocks; select Legacy for this stock"
+        return false
+    }
+    do {
+        _ = try stock.pushed(stops: settings.developmentEV)
+        return true
+    } catch {
+        context.lastError = "\(error)"
+        return false
+    }
+}
+
+/// Offer the community packs a person imported. The films the plugin ships with are plain JSON in
+/// its own Resources (`embeddedStockDirectories`), since `Bundle.main` is the video host.
+private func openCommunityPacks(in directory: String) {
+    let resources = URL(fileURLWithPath: directory, isDirectory: true)
+    // Bundle.main belongs to the video host. Read this plugin's own release version.
+    let bundleURL = resources.deletingLastPathComponent().deletingLastPathComponent()
+    let version = Bundle(url: bundleURL)?.object(
+        forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+    FilmStockPack.installedSealedPackURLs = FilmPackLibrary.compatibleCommunityPacks(
+        macAppVersion: version)
+}
+
+@_cdecl("fotufilm_bridge_context_create")
+func fotufilm_bridge_context_create() -> UnsafeMutableRawPointer? {
+    guard let context = BridgeContext(lastError: currentInitializationError()) else { return nil }
+    return Unmanaged.passRetained(context).toOpaque()
+}
+
+@_cdecl("fotufilm_bridge_context_destroy")
+func fotufilm_bridge_context_destroy(_ opaque: UnsafeMutableRawPointer?) {
+    guard let opaque else { return }
+    Unmanaged<BridgeContext>.fromOpaque(opaque).release()
+}
+
+@_cdecl("fotufilm_bridge_initialize")
+func fotufilm_bridge_initialize(_ resources: UnsafePointer<CChar>?) -> Int32 {
+    initializationLock.lock()
+    defer { initializationLock.unlock() }
+
+    let environment = ProcessInfo.processInfo.environment
+    realtimeRenderingEnabled = environment["FOTUFILM_REALTIME"] != "0"
+
+
+    if let resources {
+        let directory = String(cString: resources)
+        if environment["FOTUFILM_RESOURCES"] == nil {
+            setenv("FOTUFILM_RESOURCES", directory, 1)
+        }
+        // Bundle.main is Resolve or the FxPlug host, not this plugin. Register its bundled
+        // directory explicitly without changing the host's custom-stock environment.
+        FilmStockPack.embeddedStockDirectories = [URL(fileURLWithPath: directory,
+            isDirectory: true).appendingPathComponent("Stocks", isDirectory: true)]
+        openCommunityPacks(in: directory)
+    }
+
+    FilmStockPack.reload()
+
+    if let error = FilmStockPack.loadError {
+        initializationError = "\(error)"
+        return -1
+    }
+    initializationError = ""
+    stockIDs = FilmStock.presetIDs
+    return Int32(stockIDs.count)
+}
+
+@_cdecl("fotufilm_bridge_available")
+func fotufilm_bridge_available() -> Int32 {
+    BridgeRenderer.shared != nil ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_transforms_on_device")
+func fotufilm_bridge_transforms_on_device() -> Int32 {
+    BridgeRenderer.transformsOnDevice ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_realtime_enabled")
+func fotufilm_bridge_realtime_enabled() -> Int32 {
+    initializationLock.lock()
+    defer { initializationLock.unlock() }
+    return realtimeRenderingEnabled ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_stock_count")
+func fotufilm_bridge_stock_count() -> Int32 { Int32(stockIDs.count) }
+
+@_cdecl("fotufilm_bridge_stock_id")
+func fotufilm_bridge_stock_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                             _ capacity: Int32) -> Int32 {
+    guard stockIDs.indices.contains(Int(index)) else { return -1 }
+    return copyOut(stockIDs[Int(index)], out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_stock_name")
+func fotufilm_bridge_stock_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                               _ capacity: Int32) -> Int32 {
+    guard stockIDs.indices.contains(Int(index)),
+          let definition = FilmStock.presetDefinitions[stockIDs[Int(index)]]
+    else { return -1 }
+    return copyOut(definition.name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_paper_count")
+func fotufilm_bridge_paper_count() -> Int32 { Int32(papers.count) }
+
+@_cdecl("fotufilm_bridge_paper_id")
+func fotufilm_bridge_paper_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                             _ capacity: Int32) -> Int32 {
+    guard papers.indices.contains(Int(index)) else { return -1 }
+    return copyOut(papers[Int(index)].id, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_paper_name")
+func fotufilm_bridge_paper_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                               _ capacity: Int32) -> Int32 {
+    guard papers.indices.contains(Int(index)) else { return -1 }
+    return copyOut(papers[Int(index)].name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_paper_is_negative")
+func fotufilm_bridge_paper_is_negative(_ index: Int32) -> Int32 {
+    guard papers.indices.contains(Int(index)) else { return 0 }
+    return papers[Int(index)].isNegative ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_lens_filter_count")
+func fotufilm_bridge_lens_filter_count() -> Int32 { Int32(lensFilters.count) }
+
+@_cdecl("fotufilm_bridge_lens_filter_id")
+func fotufilm_bridge_lens_filter_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                   _ capacity: Int32) -> Int32 {
+    guard lensFilters.indices.contains(Int(index)) else { return -1 }
+    return copyOut(lensFilters[Int(index)].id, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_lens_filter_name")
+func fotufilm_bridge_lens_filter_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                     _ capacity: Int32) -> Int32 {
+    guard lensFilters.indices.contains(Int(index)) else { return -1 }
+    return copyOut(lensFilters[Int(index)].name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_metering_count")
+func fotufilm_bridge_metering_count() -> Int32 { Int32(meterings.count) }
+
+@_cdecl("fotufilm_bridge_metering_id")
+func fotufilm_bridge_metering_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                _ capacity: Int32) -> Int32 {
+    guard meterings.indices.contains(Int(index)) else { return -1 }
+    return copyOut(meterings[Int(index)].rawValue, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_metering_name")
+func fotufilm_bridge_metering_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                  _ capacity: Int32) -> Int32 {
+    guard meterings.indices.contains(Int(index)) else { return -1 }
+    return copyOut(meterings[Int(index)].label, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_diffusion_family_count")
+func fotufilm_bridge_diffusion_family_count() -> Int32 { Int32(diffusionFamilies.count) }
+
+@_cdecl("fotufilm_bridge_diffusion_family_id")
+func fotufilm_bridge_diffusion_family_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                        _ capacity: Int32) -> Int32 {
+    guard diffusionFamilies.indices.contains(Int(index)) else { return -1 }
+    return copyOut(diffusionFamilies[Int(index)].rawValue, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_diffusion_family_name")
+func fotufilm_bridge_diffusion_family_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                          _ capacity: Int32) -> Int32 {
+    guard diffusionFamilies.indices.contains(Int(index)) else { return -1 }
+    return copyOut(diffusionFamilies[Int(index)].label, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_diffusion_grade_count")
+func fotufilm_bridge_diffusion_grade_count() -> Int32 { Int32(diffusionGrades.count) }
+
+@_cdecl("fotufilm_bridge_diffusion_grade_id")
+func fotufilm_bridge_diffusion_grade_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                       _ capacity: Int32) -> Int32 {
+    guard diffusionGrades.indices.contains(Int(index)) else { return -1 }
+    return copyOut(diffusionGrades[Int(index)].rawValue, out, capacity)
+}
+
+/// The grade's name is its id: 1/8 is what the ring says and what the engine takes.
+@_cdecl("fotufilm_bridge_diffusion_grade_name")
+func fotufilm_bridge_diffusion_grade_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                         _ capacity: Int32) -> Int32 {
+    guard diffusionGrades.indices.contains(Int(index)) else { return -1 }
+    return copyOut(diffusionGrades[Int(index)].rawValue, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_diffusion_default_grade")
+func fotufilm_bridge_diffusion_default_grade() -> Int32 {
+    Int32(diffusionGrades.firstIndex(of: defaultDiffusionGrade) ?? 0)
+}
+
+@_cdecl("fotufilm_bridge_negative_viewing_count")
+func fotufilm_bridge_negative_viewing_count() -> Int32 { Int32(negativeViewings.count) }
+
+@_cdecl("fotufilm_bridge_negative_viewing_id")
+func fotufilm_bridge_negative_viewing_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                        _ capacity: Int32) -> Int32 {
+    guard negativeViewings.indices.contains(Int(index)) else { return -1 }
+    return copyOut(negativeViewings[Int(index)].id, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_negative_viewing_name")
+func fotufilm_bridge_negative_viewing_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                          _ capacity: Int32) -> Int32 {
+    guard negativeViewings.indices.contains(Int(index)) else { return -1 }
+    return copyOut(negativeViewings[Int(index)].name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_stage_count")
+func fotufilm_bridge_stage_count() -> Int32 { Int32(stages.count) }
+
+@_cdecl("fotufilm_bridge_stage_id")
+func fotufilm_bridge_stage_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                             _ capacity: Int32) -> Int32 {
+    guard stages.indices.contains(Int(index)) else { return -1 }
+    return copyOut(stages[Int(index)].id, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_stage_name")
+func fotufilm_bridge_stage_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                               _ capacity: Int32) -> Int32 {
+    guard stages.indices.contains(Int(index)) else { return -1 }
+    return copyOut(stages[Int(index)].name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_texture_stage_count")
+func fotufilm_bridge_texture_stage_count() -> Int32 { Int32(textureStages.count) }
+
+@_cdecl("fotufilm_bridge_texture_stage_id")
+func fotufilm_bridge_texture_stage_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                     _ capacity: Int32) -> Int32 {
+    guard textureStages.indices.contains(Int(index)) else { return -1 }
+    return copyOut(textureStages[Int(index)].id, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_texture_stage_name")
+func fotufilm_bridge_texture_stage_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                       _ capacity: Int32) -> Int32 {
+    guard textureStages.indices.contains(Int(index)) else { return -1 }
+    return copyOut(textureStages[Int(index)].name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_texture_stage_mask")
+func fotufilm_bridge_texture_stage_mask(_ index: Int32) -> Int32 {
+    guard textureStages.indices.contains(Int(index)) else { return 0 }
+    return textureStages[Int(index)].value.rawValue
+}
+
+@_cdecl("fotufilm_bridge_texture_stage_available")
+func fotufilm_bridge_texture_stage_available(_ stockIndex: Int32, _ index: Int32) -> Int32 {
+    guard textureStages.indices.contains(Int(index)),
+          let stock = stock(at: stockIndex) else { return 0 }
+    return TextureStages.offered(by: stock).contains(textureStages[Int(index)].value) ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_stock_prints")
+func fotufilm_bridge_stock_prints(_ stockIndex: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return 0 }
+    return PrintPaper.choices(for: stock).count > 1 ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_control_capabilities")
+func fotufilm_bridge_control_capabilities(_ stockIndex: Int32, _ paperIndex: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return 0 }
+    let paper = resolvedPaper(stock: stock, index: paperIndex)
+    var flags: Int32 = 0
+    if !stock.isMonochrome && !stock.isReversal { flags |= 1 }
+    if stock.couplerGeometry != nil { flags |= 2 }
+    if !stock.isMonochrome { flags |= 32 }
+    if stock.couplerInhibition.contains(where: { $0.contains(where: { $0 != 0 }) })
+        || stock.adjacencyStrength > 0 {
+        flags |= 64
+    }
+    if stock.reciprocityFailure != nil { flags |= 4 }
+    if paper.acceptsViewingIlluminant { flags |= 8 }
+    if paper.acceptsPrintCorrection && !stock.isMonochrome && !stock.isReversal { flags |= 16 }
+    if Enlarger.illuminates(stock: stock, paper: paper) { flags |= 128 }
+    if paper == .screen && !stock.isReflectionPrint { flags |= 512 }
+    if paper == .screen && !stock.isReversal { flags |= 1024 }
+    if paper == .labScan && !stock.isReversal && !stock.isReflectionPrint { flags |= 2048 }
+    if PrinterLights.applies(stock: stock, paper: paper) { flags |= 4096 }
+    if EditorControlCatalogue.medium(paper, offers: .shadowDetail, stock: stock,
+                                     digitalReference: .referenceExposure) {
+        flags |= 8192
+    }
+    if EditorControlAvailability.interlayerInhibition.admits(stock: stock) { flags |= 256 }
+    return flags
+}
+
+private func resolvedPaper(stock: FilmStock, index: Int32) -> PrintPaper {
+    let requested = papers.indices.contains(Int(index)) ? papers[Int(index)] : nil
+    return requested?.resolved(for: stock) ?? PrintPaper.default(for: stock)
+}
+
+@_cdecl("fotufilm_bridge_resolved_format")
+func fotufilm_bridge_resolved_format(_ stockIndex: Int32, _ format: Int32,
+                                   _ out: UnsafeMutablePointer<CChar>?, _ capacity: Int32) -> Int32 {
+    guard stockIDs.indices.contains(Int(stockIndex)) else { return -1 }
+    let presets = FilmFormat.presets
+    let resolved = presets.indices.contains(Int(format)) ? presets[Int(format)].format
+        : FilmFormat.native(forStockID: stockIDs[Int(stockIndex)])
+    return copyOut(resolved.name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_resolved_paper")
+func fotufilm_bridge_resolved_paper(_ stockIndex: Int32, _ paperIndex: Int32,
+                                  _ out: UnsafeMutablePointer<CChar>?, _ capacity: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return -1 }
+    return copyOut(resolvedPaper(stock: stock, index: paperIndex).name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_delivers_code_values")
+func fotufilm_bridge_delivers_code_values(_ stockIndex: Int32, _ paperIndex: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return 0 }
+    return resolvedPaper(stock: stock, index: paperIndex).deliversCodeValues ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_development_count")
+func fotufilm_bridge_development_count(_ stockIndex: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return 0 }
+    return Int32(stock.supportedDevelopmentStops.count + 1)
+}
+
+@_cdecl("fotufilm_bridge_development_stop")
+func fotufilm_bridge_development_stop(_ stockIndex: Int32, _ index: Int32) -> Float {
+    guard let stock = stock(at: stockIndex) else { return .nan }
+    let stops = ([Float(0)] + stock.supportedDevelopmentStops).sorted()
+    return stops.indices.contains(Int(index)) ? stops[Int(index)] : .nan
+}
+
+/// The node's schedule. This policy is also queried by the OFX decoder, so a per-node override
+/// changes every pass together, including striped frames.
+@_cdecl("fotufilm_bridge_effective_realtime")
+func fotufilm_bridge_effective_realtime(_ parameters: UnsafePointer<Float>?) -> Int32 {
+    switch whole(parameters?[Parameter.renderMode] ?? 0) {
+    case 1: return 1
+    case 2: return 0
+    default: return realtimeRenderingEnabled ? 1 : 0
+    }
+}
+
+@_cdecl("fotufilm_bridge_stock_pushes")
+func fotufilm_bridge_stock_pushes(_ stockIndex: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return 0 }
+    return stock.hasDevelopmentConditions ? 1 : 0
+}
+
+/// Where the stock's push and pull curves come from; empty without conditions.
+@_cdecl("fotufilm_bridge_development_basis")
+func fotufilm_bridge_development_basis(_ stockIndex: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                       _ capacity: Int32) -> Int32 {
+    guard let stock = stock(at: stockIndex) else { return -1 }
+    return copyOut(stock.developmentProfile.map(EditorControlCatalogue.pushDetail) ?? "",
+                   out, capacity)
+}
+
+/// Keep the persisted numeric development condition on the stock's measurements. The visible
+/// OFX menu is derived from these conditions; the number preserves older projects.
+@_cdecl("fotufilm_bridge_stock_snap_push")
+func fotufilm_bridge_stock_snap_push(_ stockIndex: Int32, _ requested: Float) -> Float {
+    guard requested.isFinite, let stock = stock(at: stockIndex) else { return 0 }
+    return ([Float(0)] + stock.supportedDevelopmentStops).min { lhs, rhs in
+        let lhsDistance = abs(lhs - requested)
+        let rhsDistance = abs(rhs - requested)
+        if lhsDistance == rhsDistance { return abs(lhs) < abs(rhs) }
+        return lhsDistance < rhsDistance
+    } ?? 0
+}
+
+@_cdecl("fotufilm_bridge_format_count")
+func fotufilm_bridge_format_count() -> Int32 { Int32(FilmFormat.presets.count) }
+
+@_cdecl("fotufilm_bridge_format_id")
+func fotufilm_bridge_format_id(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                              _ capacity: Int32) -> Int32 {
+    let presets = FilmFormat.presets
+    guard presets.indices.contains(Int(index)) else { return -1 }
+    return copyOut(presets[Int(index)].id, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_format_name")
+func fotufilm_bridge_format_name(_ index: Int32, _ out: UnsafeMutablePointer<CChar>?,
+                                _ capacity: Int32) -> Int32 {
+    let presets = FilmFormat.presets
+    guard presets.indices.contains(Int(index)) else { return -1 }
+    return copyOut(presets[Int(index)].format.name, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_last_error")
+func fotufilm_bridge_last_error(_ opaque: UnsafeMutableRawPointer?,
+                               _ out: UnsafeMutablePointer<CChar>?,
+                               _ capacity: Int32) -> Int32 {
+    guard let context = context(opaque) else {
+        return copyOut(currentInitializationError(), out, capacity)
+    }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+    return copyOut(context.lastError, out, capacity)
+}
+
+@_cdecl("fotufilm_bridge_prepare")
+func fotufilm_bridge_prepare(_ opaque: UnsafeMutableRawPointer?,
+                            _ stockIndex: Int32, _ format: Int32, _ paper: Int32,
+                            _ parameters: UnsafePointer<Float>?,
+                            _ width: Int32, _ height: Int32) -> Int32 {
+    guard let context = context(opaque) else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+
+    guard let renderer = BridgeRenderer.shared else {
+        context.lastError = BridgeRenderer.missingDevice
+        return 0
+    }
+    guard let stock = stock(at: stockIndex) else {
+        context.lastError = "no film stock at index \(stockIndex)"
+        return 0
+    }
+    guard stage(of: parameters) != nil else {
+        context.lastError =
+            "no pipeline stage at index \(whole(parameters?[Parameter.stage] ?? 0))"
+        return 0
+    }
+    guard width > 0, height > 0 else { return 0 }
+    let settings = options(parameters, format: format,
+                           stockIndex: stockIndex, paper: paper, seed: 0)
+    guard validateDevelopment(settings, stock: stock, context: context) else { return 0 }
+    return context.withDevice {
+        renderer.prepare(stock: stock, options: settings,
+                         frameWidth: Int(width), frameHeight: Int(height)) ? 1 : 0
+    }
+}
+
+@_cdecl("fotufilm_bridge_encodes_output")
+func fotufilm_bridge_encodes_output(_ opaque: UnsafeMutableRawPointer?,
+                                   _ stockIndex: Int32, _ format: Int32, _ paper: Int32,
+                                   _ parameters: UnsafePointer<Float>?,
+                                   _ width: Int32, _ height: Int32,
+                                   _ interactive: Int32) -> Int32 {
+    guard let context = context(opaque) else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+
+    let values = parameters.map {
+        Array(UnsafeBufferPointer(start: $0, count: Parameter.count))
+    } ?? []
+    // The road the frame will take is the staging this context holds: `fotufilm_bridge_render_staged`
+    // refuses a frame with none claimed, and `fotufilm_bridge_render` never measures glare in the
+    // kernel. So the question is asked exactly as the render will be — with the on-device
+    // measurement only for a staged frame, on the same terms `fotufilm_bridge_render_staged` uses —
+    // and the host has to claim or be refused staging before it asks.
+    let staged = context.frameStaging.map { $0.capacityPixels >= Int(width) * Int(height) }
+        ?? false
+    let key = OutputTransformQueryKey(
+        stock: stockIndex, format: format, paper: paper, width: width, height: height,
+        interactive: interactive, staged: staged, parameters: values)
+    if let cached = context.outputQuery, cached.key == key { return cached.answer }
+
+    guard let renderer = BridgeRenderer.shared,
+          let stock = stock(at: stockIndex), stage(of: parameters) != nil,
+          width > 0, height > 0 else { return 0 }
+    let settings = options(parameters, format: format,
+                           stockIndex: stockIndex, paper: paper, seed: 0)
+    guard validateDevelopment(settings, stock: stock, context: context) else { return 0 }
+    let answer: Int32 = renderer.carriesOutputTransform(
+        stock: stock, options: settings, width: Int(width), height: Int(height),
+        realtime: fotufilm_bridge_effective_realtime(parameters) != 0,
+        measuresGlareOnDevice: staged && (fotufilm_bridge_effective_realtime(parameters) != 0 || interactive != 0)) ? 1 : 0
+    context.outputQuery = OutputTransformQuery(key: key, answer: answer)
+    return answer
+}
+
+@_cdecl("fotufilm_bridge_frame_staging")
+func fotufilm_bridge_frame_staging(
+    _ opaque: UnsafeMutableRawPointer?,
+    _ width: Int32, _ height: Int32,
+    _ input: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>?,
+    _ output: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>?
+) -> Int32 {
+    guard let context = context(opaque) else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+    // A render aborted between claiming staging and developing it leaves the prior claim here.
+    // Return it before the next frame borrows a pair.
+    context.releaseStaging()
+
+    guard let input, let output, width > 0, height > 0,
+          let renderer = BridgeRenderer.shared,
+          BridgeRenderer.developsInOnePass(width: Int(width),
+                                                    height: Int(height))
+    else { return 0 }
+
+    let pixels = Int(width) * Int(height)
+    guard let staging = renderer.borrowFrameStaging(pixels: pixels) else { return 0 }
+    context.frameStaging = staging
+    input.pointee = staging.scenePixels
+    output.pointee = staging.developedPixels
+    return 1
+}
+
+@_cdecl("fotufilm_bridge_release_staging")
+func fotufilm_bridge_release_staging(_ opaque: UnsafeMutableRawPointer?) {
+    guard let context = context(opaque) else { return }
+    context.lock.lock()
+    context.releaseStaging()
+    context.lock.unlock()
+}
+
+@_cdecl("fotufilm_bridge_camera_input_transform")
+func fotufilm_bridge_camera_input_transform(_ index: Int32,
+                                            _ out: UnsafeMutableRawPointer?) -> Int32 {
+    guard cameraInputDecoders.indices.contains(Int(index)), let out else { return 0 }
+    let encoding = EditorControlCatalogue.pluginCameraInputs[Int(index)].encoding
+    guard let coefficients = encoding.curve.exponentialTransfer else { return 0 }
+    let matrix = encoding.gamut.toRec2020
+    guard matrix.count == 9, coefficients.count == 6 else { return 0 }
+    out.assumingMemoryBound(to: Int32.self)[InputTransformField.transfer] =
+        FilmInputTransform.Transfer.exponential.rawValue
+    let floats = (out + InputTransformField.firstFloat).assumingMemoryBound(to: Float.self)
+    for (offset, value) in matrix.enumerated() {
+        floats[InputTransformField.matrix + offset] = Float(value)
+    }
+    for (offset, value) in coefficients.enumerated() {
+        floats[InputTransformField.coefficients + offset] = value
+    }
+    return 1
+}
+
+@_cdecl("fotufilm_bridge_host_metal_usable")
+func fotufilm_bridge_host_metal_usable(_ queue: UnsafeMutableRawPointer?,
+                                       _ source: UnsafeMutableRawPointer?,
+                                       _ output: UnsafeMutableRawPointer?) -> Int32 {
+    BridgeHostFrames.usable(queue: queue, buffers: [source, output]) ? 1 : 0
+}
+
+@_cdecl("fotufilm_bridge_host_metal_staging")
+func fotufilm_bridge_host_metal_staging(
+    _ opaque: UnsafeMutableRawPointer?,
+    _ scene: UnsafeMutablePointer<UnsafeMutableRawPointer?>?,
+    _ developed: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+) -> Int32 {
+    guard let context = context(opaque), let scene, let developed else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+    guard let buffers = BridgeHostFrames.staging(context.frameStaging) else { return 0 }
+    scene.pointee = buffers.scene
+    developed.pointee = buffers.developed
+    return 1
+}
+
+@_cdecl("fotufilm_bridge_host_metal_mirror")
+func fotufilm_bridge_host_metal_mirror(
+    _ opaque: UnsafeMutableRawPointer?, _ slot: Int32, _ bytes: Int64,
+    _ buffer: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+) -> UnsafeMutableRawPointer? {
+    guard let context = context(opaque), let buffer else { return nil }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+    guard let mirror = context.hostFrames.mirror(slot: Int(slot), bytes: Int(bytes))
+    else { return nil }
+    buffer.pointee = mirror.buffer
+    return mirror.contents
+}
+
+@_cdecl("fotufilm_bridge_host_metal_copy")
+func fotufilm_bridge_host_metal_copy(
+    _ queue: UnsafeMutableRawPointer?,
+    _ source: UnsafeMutableRawPointer?, _ sourceBase: Int64, _ sourceStep: Int64,
+    _ destination: UnsafeMutableRawPointer?, _ destinationBase: Int64,
+    _ destinationStep: Int64, _ width: Int32, _ rows: Int32
+) -> Int32 {
+    BridgeHostFrames.copy(queue: queue, source: source, sourceBase: Int(sourceBase),
+                          sourceStep: Int(sourceStep), destination: destination,
+                          destinationBase: Int(destinationBase),
+                          destinationStep: Int(destinationStep), width: Int(width),
+                          rows: Int(rows))
+}
+
+@_cdecl("fotufilm_bridge_decode_staged")
+func fotufilm_bridge_decode_staged(
+    _ opaque: UnsafeMutableRawPointer?,
+    _ width: Int32, _ height: Int32,
+    _ transformIn: UnsafeRawPointer?,
+    _ peak: UnsafeMutablePointer<Float>?,
+    _ repaired: UnsafeMutablePointer<Int32>?,
+    _ realtime: Int32
+) -> Int32 {
+    guard let context = context(opaque) else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+
+    guard width > 0, height > 0,
+          let renderer = BridgeRenderer.shared,
+          let transform = inputTransform(transformIn),
+          let staging = context.frameStaging,
+          staging.capacityPixels >= Int(width) * Int(height)
+    else { return 0 }
+    guard let report = context.withDevice({
+        renderer.decodeStaged(
+            staging, width: Int(width), height: Int(height), transform: transform,
+            realtime: realtime != 0)
+    }) else { return 0 }
+
+    peak?.pointee = report.peak
+    repaired?.pointee = report.repaired ? 1 : 0
+    return 1
+}
+
+@_cdecl("fotufilm_bridge_decode_rows")
+func fotufilm_bridge_decode_rows(
+    _ input: UnsafePointer<Float>?, _ output: UnsafeMutablePointer<Float>?,
+    _ width: Int32, _ rows: Int32,
+    _ transformIn: UnsafeRawPointer?,
+    _ peak: UnsafeMutablePointer<Float>?,
+    _ repaired: UnsafeMutablePointer<Int32>?,
+    _ realtime: Int32
+) -> Int32 {
+    guard width > 0, rows > 0, let input, let output,
+          let renderer = BridgeRenderer.shared,
+          let transform = inputTransform(transformIn),
+          let report = renderer.decodeRows(input, into: output, width: Int(width),
+                                           rows: Int(rows), transform: transform,
+                                           realtime: realtime != 0)
+    else { return 0 }
+
+    peak?.pointee = report.peak
+    repaired?.pointee = report.repaired ? 1 : 0
+    return 1
+}
+
+@_cdecl("fotufilm_bridge_render_staged")
+func fotufilm_bridge_render_staged(
+    _ opaque: UnsafeMutableRawPointer?,
+    _ stockIndex: Int32, _ format: Int32, _ paper: Int32,
+    _ parameters: UnsafePointer<Float>?, _ seed: UInt32,
+    _ width: Int32, _ height: Int32, _ frame: UInt64,
+    _ interactive: Int32,
+    _ outputTransformIn: UnsafeMutableRawPointer?,
+    _ shouldContinue: (@convention(c) (UnsafeMutableRawPointer?) -> Int32)?,
+    _ abortContext: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let context = context(opaque) else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+
+    guard let renderer = BridgeRenderer.shared else {
+        context.lastError = BridgeRenderer.missingDevice
+        return 0
+    }
+    guard let stock = stock(at: stockIndex) else {
+        context.lastError = "no film stock at index \(stockIndex)"
+        return 0
+    }
+    guard let chosen = stage(of: parameters) else {
+        context.lastError =
+            "no pipeline stage at index \(whole(parameters?[Parameter.stage] ?? 0))"
+        return 0
+    }
+    guard width > 0, height > 0, let staging = context.frameStaging,
+          staging.capacityPixels >= Int(width) * Int(height) else {
+        context.lastError = "no frame staging claimed for a \(width)x\(height) frame"
+        return 0
+    }
+
+    let settings = options(parameters, format: format,
+                           stockIndex: stockIndex, paper: paper, seed: seed)
+    guard validateDevelopment(settings, stock: stock, context: context) else { return 0 }
+    // This pointwise check has the same result for a strip or a full frame. Output transforms are
+    // invalid for stages that produce densities; see the stage contract in the header.
+    if outputTransformIn != nil && !chosen.writesEncodableLight {
+        context.lastError =
+            "\(chosen.name) hands back data, which the host's transfer cannot encode"
+        return 0
+    }
+    let wanted = outputTransformIn != nil
+    var transform = outputTransform(outputTransformIn)
+    let ok = context.withDevice {
+        renderer.developStaged(
+            staging, width: Int(width), height: Int(height), stock: stock,
+            options: settings,
+            outputTransform: &transform,
+            frameIndex: parameters?[Parameter.grainFrozen] == 1 ? 0 : frame,
+            realtime: fotufilm_bridge_effective_realtime(parameters) != 0,
+            // The realtime output variant carries this reduction in the same schedule. Reference
+            // rendering retains the earlier rule: only disposable viewer frames accept its
+            // sub-LSB reduction difference, while deliveries use the host measurement.
+            measuresGlareOnDevice: fotufilm_bridge_effective_realtime(parameters) != 0 || interactive != 0,
+            shouldContinue: shouldContinue.map { keepGoing in
+                { keepGoing(abortContext) != 0 }
+            })
+    }
+    // The host reads the frame on what `fotufilm_bridge_encodes_output` told it, so a render that
+    // could not keep that promise fails rather than return light the host would write out
+    // under the timeline's label. The query mirrors this call's kernel choice — staging held,
+    // same `interactive` — so this is reachable only through a host that asked before claiming
+    // staging, or asked with a different flag than it rendered with.
+    if ok && wanted && transform == nil {
+        context.lastError = "the engine has no kernel that carries the output transform for this frame"
+        return 0
+    }
+
+    if !ok {
+        // The same distinction `fotufilm_bridge_render` draws: the host changing its mind is not
+        // a failure, and leaves no error behind.
+        if let shouldContinue, shouldContinue(abortContext) == 0 { return -1 }
+        context.lastError = "the engine could not develop a \(width)x\(height) frame"
+        return 0
+    }
+    return 1
+}
+
+@_cdecl("fotufilm_bridge_render")
+func fotufilm_bridge_render(_ opaque: UnsafeMutableRawPointer?,
+                           _ stockIndex: Int32, _ format: Int32, _ paper: Int32,
+                           _ parameters: UnsafePointer<Float>?, _ seed: UInt32,
+                           _ input: UnsafePointer<Float>?,
+                           _ width: Int32, _ height: Int32,
+                           _ frame: UInt64,
+                           _ writeRows: (@convention(c) (
+                               UnsafeMutableRawPointer?, Int32, Int32,
+                               UnsafePointer<Float>?) -> Void)?,
+                           _ writeContext: UnsafeMutableRawPointer?,
+                           _ outputTransformIn: UnsafeMutableRawPointer?,
+                           _ shouldContinue: (@convention(c) (
+                               UnsafeMutableRawPointer?) -> Int32)?,
+                           _ abortContext: UnsafeMutableRawPointer?) -> Int32 {
+    guard let context = context(opaque) else { return 0 }
+    context.lock.lock()
+    defer { context.lock.unlock() }
+
+    guard let renderer = BridgeRenderer.shared else {
+        context.lastError = BridgeRenderer.missingDevice
+        return 0
+    }
+    guard let stock = stock(at: stockIndex) else {
+        context.lastError = "no film stock at index \(stockIndex)"
+        return 0
+    }
+    guard let chosen = stage(of: parameters) else {
+        context.lastError =
+            "no pipeline stage at index \(whole(parameters?[Parameter.stage] ?? 0))"
+        return 0
+    }
+    guard let input, let writeRows, width > 0, height > 0 else {
+        context.lastError = "empty frame"
+        return 0
+    }
+
+    let settings = options(parameters, format: format,
+                           stockIndex: stockIndex, paper: paper, seed: seed)
+    guard validateDevelopment(settings, stock: stock, context: context) else { return 0 }
+    let rowFloats = Int(width) * 4
+
+    // Match the staged path so memory-dependent path selection does not change output. Output
+    // transforms are invalid for stages that produce densities.
+    if outputTransformIn != nil && !chosen.writesEncodableLight {
+        context.lastError =
+            "\(chosen.name) hands back data, which the host's transfer cannot encode"
+        return 0
+    }
+    let wanted = outputTransformIn != nil
+    var transform = outputTransform(outputTransformIn)
+    let ok = context.withDevice {
+        renderer.developStreaming(
+            width: Int(width), height: Int(height), stock: stock, options: settings,
+            outputTransform: &transform,
+            frameIndex: parameters?[Parameter.grainFrozen] == 1 ? 0 : frame,
+            realtime: fotufilm_bridge_effective_realtime(parameters) != 0,
+            shouldContinue: shouldContinue.map { keepGoing in
+                { keepGoing(abortContext) != 0 }
+            },
+            readRows: { rows, into in
+                into.baseAddress!.update(from: input + rows.lowerBound * rowFloats,
+                                         count: rows.count * rowFloats)
+            },
+            writeRows: { rows, from in
+                writeRows(writeContext, Int32(rows.lowerBound),
+                      Int32(rows.upperBound), from.baseAddress)
+            })
+    }
+    // As on the staged path — except that here the rows are already gone, which is the whole
+    // reason the host has to have asked beforehand. This road never measures glare in the
+    // kernel, and the query knows that from the staging the context does not hold; so this is
+    // reachable only through a host that asked while it still held staging for the frame.
+    if ok && wanted && transform == nil {
+        context.lastError = "the engine has no kernel that carries the output transform for this frame"
+        return 0
+    }
+
+    if !ok {
+        // Distinguish the host changing its mind from the engine failing; only the
+        // latter deserves an error the host might show.
+        if let shouldContinue, shouldContinue(abortContext) == 0 { return -1 }
+        context.lastError = "the engine could not develop a \(width)x\(height) frame"
+        return 0
+    }
+    return 1
+}
