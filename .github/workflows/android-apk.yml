@@ -32,7 +32,8 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list
           sudo apt-get update -q
           sudo apt-get install -qy --no-install-recommends \
-            llvm-22-dev clang-22 lld-22 libclang-22-dev \
+            llvm-22-dev clang-22 lld-22 liblld-22-dev libclang-22-dev \
+            libedit-dev libcurl4-openssl-dev \
             libvulkan-dev cmake ninja-build rsync
 
       - name: Android NDK r27c
