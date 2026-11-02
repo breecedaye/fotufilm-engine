@@ -90,7 +90,17 @@ jobs:
           "$SWIFT_TOOLCHAIN/usr/bin/swift" sdk install \
             https://download.swift.org/swift-6.3.3-release/android-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_android.artifactbundle.tar.gz \
             --checksum d160cc3206dd1886dae3fef2337af5e25ec034692cd0ec225721c56cc69da7f5
+          # On Linux the CLI installs under XDG_DATA_HOME; the engine script looks in
+          # ~/.swiftpm/swift-sdks — move the bundle there so both agree.
+          src=$(find "$HOME/.local/share/swiftpm/swift-sdks" "$HOME/.swiftpm/swift-sdks" \
+            -maxdepth 1 -name 'swift-6.3.3-RELEASE_android.artifactbundle' 2>/dev/null | head -1)
+          dest="$HOME/.swiftpm/swift-sdks/swift-6.3.3-RELEASE_android.artifactbundle"
+          if [ -n "$src" ] && [ "$src" != "$dest" ]; then
+            mkdir -p "$HOME/.swiftpm/swift-sdks"
+            mv "$src" "$dest"
+          fi
           ls "$HOME/.swiftpm/swift-sdks/"
+          ls "$HOME/.swiftpm/swift-sdks/swift-6.3.3-RELEASE_android.artifactbundle/swift-android"
 
       - name: Build the engine (libfotufilm.so)
         run: |
